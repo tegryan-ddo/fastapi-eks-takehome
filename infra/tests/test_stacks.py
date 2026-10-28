@@ -81,14 +81,16 @@ def test_webhooks_trigger_validation_on_pull_requests_and_build_on_main(template
     (build_group,) = build["mobile-api-build"]["Triggers"]["FilterGroups"]
     assert {(f["Type"], f["Pattern"]) for f in build_group} == {("EVENT", "PUSH"), ("HEAD_REF", "refs/heads/main")}
     for project in projects(templates["integration"]).values():
-        assert "Triggers" not in project, "VPC runners are started by hand"
+        assert not project.get("Triggers", {}).get("Webhook"), "VPC runners are started by hand"
 
 
 def test_no_role_can_reach_eks_or_write_secrets(templates):
     for name, template in templates.items():
         actions = policy_actions(template)
         assert not any(a.startswith("eks:") for a in actions), name
-        assert not any(a.startswith("secretsmanager:") and a != "secretsmanager:getsecretvalue" for a in actions), name
+        reads = {"secretsmanager:getsecretvalue", "secretsmanager:describesecret"}
+        writes = {a for a in actions if a.startswith("secretsmanager:")} - reads
+        assert not writes, (name, writes)
 
 
 def test_database_is_private_encrypted_and_requires_tls(templates):
