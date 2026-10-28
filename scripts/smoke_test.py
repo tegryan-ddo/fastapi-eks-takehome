@@ -7,9 +7,10 @@ Waits up to --ready-deadline seconds for the readiness endpoint, then checks
 the liveness endpoint and the service identity returned by GET /. HTTPS
 certificates are verified.
 
-A pass shows only that the service is reachable, ready, and is the expected
-build. The demo's health endpoints do not exercise Postgres, payment
-processing, or the batch job.
+A pass shows that the service is reachable, reports ready (which for this
+application includes a bounded PostgreSQL connectivity check), and is the
+expected build. It does not exercise payment processing, the batch job, or
+data correctness.
 """
 
 import argparse
@@ -113,8 +114,8 @@ def main():
         check(args, LIVE_PATH, expect_ok),
         check(args, "/", expect_identity(args)),
     ])
-    print(f"{'PASSED' if passed else 'FAILED'}: {args.base_url} (reachability and identity only; "
-          "no database, payment, or batch checks)")
+    print(f"{'PASSED' if passed else 'FAILED'}: {args.base_url} (reachability, readiness including database "
+          "connectivity, and identity; no payment, batch, or data checks)")
     return 0 if passed else 1
 
 

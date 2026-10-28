@@ -18,6 +18,10 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && pip check \
     && pip uninstall --yes pip
 
+# Public RDS certificate authorities, used when DATABASE_URL has
+# sslmode=verify-full (the default). See certs/README.md.
+COPY certs/rds-global-bundle.pem /srv/certs/
+
 COPY app/ ./app/
 
 ARG APP_VERSION=dev
@@ -29,5 +33,7 @@ EXPOSE 8000
 # Exec form makes Uvicorn PID 1, so it receives SIGTERM directly and runs the
 # FastAPI lifespan shutdown. Graceful shutdown is capped at 20s; the chart's
 # terminationGracePeriodSeconds (30s) covers this plus the 5s preStop sleep.
-# The batch CronJob overrides this with: python -m app.batch
+# Other entry points from the same image:
+#   python -m app.migrate   schema migration, run as a release step
+#   python -m app.batch     the daily batch, run by the CronJob
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--timeout-graceful-shutdown", "20"]
