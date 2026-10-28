@@ -82,6 +82,8 @@ def expect_identity(args):
             return f"service {data.get('service')!r}, expected {args.expect_service!r}"
         if args.expect_version and data.get("version") != args.expect_version:
             return f"version {data.get('version')!r}, expected {args.expect_version!r}"
+        if args.expect_demo and data.get("demo") is not True:
+            return f"demo {data.get('demo')!r}, expected true"
         return None
 
     return expect
@@ -96,6 +98,7 @@ def main():
     parser.add_argument("base_url", help="e.g. http://localhost:8000 or https://staging.example.com")
     parser.add_argument("--expect-service", default="demo-api", help="expected 'service' in GET / (default: demo-api)")
     parser.add_argument("--expect-version", help="expected 'version' in GET /; not checked if omitted")
+    parser.add_argument("--expect-demo", action="store_true", help="require 'demo': true in GET / (demo image only)")
     parser.add_argument("--connect-timeout", type=float, default=3, help="seconds to connect, including TLS (default: 3)")
     parser.add_argument("--response-timeout", type=float, default=5, help="seconds to wait for response data (default: 5)")
     parser.add_argument("--ready-deadline", type=float, default=60, help="seconds to wait for readiness (default: 60)")

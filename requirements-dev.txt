@@ -1,10 +1,22 @@
-# Verification tooling. Not installed in the application image.
+# Verification tooling and test dependencies. Not installed in the application image.
+-r examples/demo-api/requirements.txt
+-r requirements-secrets.txt
+
 pytest==9.2.0
 PyYAML==6.0.3
+httpx2==2.16.0  # FastAPI TestClient (Starlette deprecates httpx)
 
-# Transitive dependencies of pytest
+# Transitive dependencies of the packages above
+botocore==1.43.121
 colorama==0.4.6 ; sys_platform == "win32"
+httpcore2==2.16.0
 iniconfig==2.3.1
+jmespath==1.1.0
 packaging==26.3
 pluggy==1.7.0
 pygments==2.21.0
+python-dateutil==2.9.0.post0
+s3transfer==0.19.3
+six==1.17.0
+truststore==0.10.5
+urllib3==2.8.0

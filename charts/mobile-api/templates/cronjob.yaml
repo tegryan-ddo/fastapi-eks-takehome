@@ -1,0 +1,65 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "mobile-api.batchName" . }}
+  labels:
+    {{- include "mobile-api.labels" . | nindent 4 }}
+    app.kubernetes.io/component: batch
+spec:
+  schedule: {{ .Values.batch.schedule | quote }}
+  timeZone: {{ .Values.batch.timeZone | quote }}
+  suspend: {{ .Values.batch.suspend }}
+  # Never start a run while the previous one is active. This applies only to
+  # Jobs this CronJob creates, not to Jobs created manually from its template.
+  concurrencyPolicy: Forbid
+  startingDeadlineSeconds: {{ .Values.batch.startingDeadlineSeconds }}
+  successfulJobsHistoryLimit: {{ .Values.batch.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.batch.failedJobsHistoryLimit }}
+  jobTemplate:
+    metadata:
+      labels:
+        {{- include "mobile-api.labels" . | nindent 8 }}
+        app.kubernetes.io/component: batch
+    spec:
+      backoffLimit: {{ .Values.batch.backoffLimit }}
+      activeDeadlineSeconds: {{ .Values.batch.activeDeadlineSeconds }}
+      ttlSecondsAfterFinished: {{ .Values.batch.ttlSecondsAfterFinished }}
+      podFailurePolicy:
+        rules:
+          # Exit code 2 means invalid arguments; retrying cannot help.
+          - action: FailJob
+            onExitCodes:
+              containerName: batch
+              operator: In
+              values: [2]
+      template:
+        metadata:
+          labels:
+            {{- include "mobile-api.labels" . | nindent 12 }}
+            app.kubernetes.io/component: batch
+        spec:
+          serviceAccountName: {{ include "mobile-api.fullname" . }}
+          automountServiceAccountToken: false
+          restartPolicy: Never
+          securityContext:
+            {{- include "mobile-api.podSecurityContext" . | nindent 12 }}
+          containers:
+            - name: batch
+              image: {{ include "mobile-api.image" . | quote }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              # Replaces the image's default command, the HTTP server.
+              command: {{ toJson .Values.batch.command }}
+              {{- if and .Values.runtimeSecret.name .Values.batch.secretKeys }}
+              {{- include "mobile-api.secretEnv" (dict "secret" .Values.runtimeSecret.name "keys" .Values.batch.secretKeys) | nindent 14 }}
+              {{- end }}
+              resources:
+                {{- toYaml .Values.batch.resources | nindent 16 }}
+              securityContext:
+                {{- include "mobile-api.containerSecurityContext" . | nindent 16 }}
+              volumeMounts:
+                - name: tmp
+                  mountPath: /tmp
+          volumes:
+            - name: tmp
+              emptyDir:
+                sizeLimit: 64Mi

@@ -1,57 +1,110 @@
 # Defaults shared by every environment. Files in environments/ override only
 # what differs. Never put credentials in values files.
-
-replicaCount: 1
+#
+# Demo application assumption: only the assignment brief was supplied. The
+# image built from examples/demo-api demonstrates container startup, health
+# checks, shutdown, and batch execution. Postgres access, payment-provider
+# integration, real batch behaviour, and production throughput are unverified.
 
 image:
   # Placeholder ECR repository; replace with the real registry.
   repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/mobile-api
   # Used when digest is empty. Defaults to the chart's appVersion.
   tag: ""
-  # Full digest, e.g. "sha256:<64 hex characters>". Takes precedence over tag.
+  # Full digest, e.g. "sha256:<64 hex characters>". Takes precedence over tag
+  # for both the API Deployment and the batch CronJob.
   digest: ""
   pullPolicy: IfNotPresent
+
+# Kubernetes Secret created in the namespace by the cluster's secrets
+# integration from AWS Secrets Manager (see docs/operations.md). The chart only
+# references it by name. Empty for the demo, which needs no secrets.
+runtimeSecret:
+  name: ""
 
 service:
   port: 80
 
-# Initial settings, not measurements. Revisit after load testing; see
-# docs/decisions.md. No CPU limit, to avoid CFS throttling on latency-sensitive
-# requests; one Uvicorn worker cannot use much more than one core anyway.
-resources:
-  requests:
-    cpu: 500m
-    memory: 512Mi
-  limits:
-    memory: 512Mi
+api:
+  # Used only when autoscaling.enabled is false.
+  replicaCount: 2
 
-# Startup and liveness use /health/live, which must never depend on Postgres
-# or other external services. Readiness gates traffic.
-startupProbe:
-  httpGet:
-    path: /health/live
-    port: http
-  periodSeconds: 2
-  timeoutSeconds: 2
-  failureThreshold: 30 # up to 60s to start before the container is restarted
+  # Initial settings, not measurements; revisit after load testing (see
+  # docs/decisions.md). The CPU request is also the HPA's utilization base.
+  # No CPU limit, to avoid CFS throttling; one Uvicorn worker cannot use much
+  # more than one core anyway.
+  resources:
+    requests:
+      cpu: 500m
+      memory: 512Mi
+    limits:
+      memory: 512Mi
 
-readinessProbe:
-  httpGet:
-    path: /health/ready
-    port: http
-  periodSeconds: 5
-  timeoutSeconds: 2
-  failureThreshold: 2
+  # Keys of runtimeSecret exposed as environment variables when it is set.
+  secretKeys: [DATABASE_URL, PAYMENTS_WEBHOOK_SECRET]
 
-livenessProbe:
-  httpGet:
-    path: /health/live
-    port: http
-  periodSeconds: 10
-  timeoutSeconds: 3
-  failureThreshold: 3
+  # Startup and liveness use /health/live, which must never depend on Postgres
+  # or other external services. Readiness gates traffic.
+  startupProbe:
+    httpGet:
+      path: /health/live
+      port: http
+    periodSeconds: 2
+    timeoutSeconds: 2
+    failureThreshold: 30 # up to 60s to start before the container is restarted
+  readinessProbe:
+    httpGet:
+      path: /health/ready
+      port: http
+    periodSeconds: 5
+    timeoutSeconds: 2
+    failureThreshold: 2
+  livenessProbe:
+    httpGet:
+      path: /health/live
+      port: http
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
 
-# Shutdown budget: preStop sleep (5s) + Uvicorn graceful shutdown (20s, set in
-# the image's startup command) must fit within terminationGracePeriodSeconds.
-preStopSleepSeconds: 5
-terminationGracePeriodSeconds: 30
+  # Shutdown budget: preStop sleep (5s) + Uvicorn graceful shutdown (20s, set
+  # in the image's startup command) must fit within the grace period.
+  preStopSleepSeconds: 5
+  terminationGracePeriodSeconds: 30
+
+autoscaling:
+  # HPA assumption: CPU utilization is the initial HPA signal. Confirm or
+  # refine it with the app team and representative load tests; database or
+  # I/O waits may increase latency without increasing CPU. maxReplicas must
+  # fit the Postgres connection budget. Requires the Kubernetes resource
+  # metrics API (metrics-server) in the cluster.
+  enabled: true
+  minReplicas: 2
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 60 # initial assumption
+
+podDisruptionBudget:
+  maxUnavailable: 1
+
+batch:
+  # Assumptions to confirm with the application team: schedule, time zone,
+  # business-date semantics, expected duration, and completion deadline.
+  schedule: "30 2 * * *" # daily at 02:30
+  timeZone: Etc/UTC
+  suspend: false
+  command: ["python", "-m", "app.batch"]
+  startingDeadlineSeconds: 3600 # skip a run that cannot start within an hour
+  backoffLimit: 2 # at most 3 attempts
+  activeDeadlineSeconds: 3600 # stop a run, including retries, after an hour
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 5
+  ttlSecondsAfterFinished: 604800 # delete finished Jobs, manual ones too, after 7 days
+  # Only the keys the job needs.
+  secretKeys: [DATABASE_URL]
+  # Initial settings, not measurements.
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      memory: 256Mi
