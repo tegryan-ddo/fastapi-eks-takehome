@@ -30,7 +30,7 @@ Production image-gate (re-check) → deploy-production           production depl
 | Step | What happens |
 | --- | --- |
 | **Source** | CodeConnections delivers one specific commit, C, from the GitHub repository. Every later step works from artifacts derived from C. |
-| **Build and validate** | The build project runs the application tests and the chart checks (lint and render for both environments, schema validation, relationship checks; see [verification.md](verification.md)). It then builds the image, runs it locally with the chart's security restrictions, smoke-tests it, and pushes it to ECR. The output is the image digest, D. |
+| **Build and validate** | The build project runs `python -m pytest`: application tests, and chart checks (lint and render for both environments, schema validation, relationship checks). It then runs `scripts/verify_container.py`, which builds the image and checks it under the chart's restrictions: endpoints, SIGTERM shutdown, and the batch command (see [verification.md](verification.md)). Finally it pushes the image to ECR. The output is the image digest, D. |
 | **Image gate** | Blocks the release until Inspector has scanned digest D and it has no unapproved critical or high findings (section 4). |
 | **Package** | Produces release artifact R: `helm package` of the chart, versioned `<chart version>+<short commit>`; `values/staging.yaml` and `values/production.yaml` taken from commit C; `release-values.yaml` setting `image.digest: D`; and `release.json` recording the commit, chart version, image digest, and pipeline execution ID. |
 | **Deploy staging** | The staging deploy project runs Helm with R only. |
@@ -63,20 +63,32 @@ the deployment logic also comes from the reviewed commit.
 
 ### Staging verification
 
-Implemented today (runs against the demo):
+Checks that also work with the demo:
 
-- Rollout: `kubectl rollout status` completes; every API pod is Ready; each
-  running pod's `imageID` contains digest D; no pod restarted after the
-  rollout; the Helm release status is `deployed`.
-- Behaviour: `python scripts/smoke_test.py https://<staging-host>
+- **Rollout:**
+  - `kubectl rollout status deployment/mobile-api` completes;
+  - every API pod is Ready;
+  - each running pod's `imageID` contains digest D;
+  - no pod restarted after the rollout;
+  - the Helm release status is `deployed`.
+- **Behaviour:** `python scripts/smoke_test.py https://<staging-host>
   --expect-service <name> --expect-version <version>`, run through the public
   HTTPS hostname, the same path customers use.
+- **Batch:** the CronJob is suspended in staging. A Job created manually from
+  `cronjob/mobile-api-batch` must complete, using digest D. The procedure is in
+  [verification.md](verification.md#manual-staging-batch-run).
 
 Required for the real application, specified in
-[verification.md](verification.md#staging-acceptance-plan): a real database
-read and write; duplicate and invalid-signature webhooks; a batch replay for
-the same business period; a rollout while requests are in flight; and an
-unhealthy replacement that never becomes ready.
+[verification.md](verification.md#staging-acceptance-plan):
+
+- a real database read and write;
+- duplicate and invalid-signature webhooks;
+- the expected batch output, and a safe replay of the same business period;
+- a rollout while requests are in flight;
+- an unhealthy replacement that never becomes ready.
+
+Only the smoke test exists as a script today. The rollout and batch checks are
+proposed commands, and none of them has run against a cluster.
 
 ### Why QUEUED execution, and why stages are grouped this way
 
@@ -134,10 +146,11 @@ by a `RoleBinding` in each environment's namespace, so each group can act only
 in its own namespace. The role allows:
 
 - full management of only the kinds the chart renders: ServiceAccounts,
-  Services, and Deployments;
+  Services, Deployments, HPAs, PDBs, and CronJobs;
+- Jobs, for manual staging batch runs;
 - ConfigMaps, for Helm's release history;
-- read-only access to ReplicaSets, Pods, and Events, to wait for and verify
-  rollouts.
+- read-only access to ReplicaSets, Pods, Events, and pod logs, to wait for and
+  verify rollouts and Jobs.
 
 It does not allow:
 
@@ -155,21 +168,84 @@ account in the namespace.
 
 The deploy projects set `HELM_DRIVER=configmap`, so Helm stores release
 history in ConfigMaps instead of Secrets. That is why the deployer needs no
-access to Secrets at all. This includes the application credentials that a
-later secrets integration will place in the namespace.
+access to Secrets at all, including the application credentials the secrets
+integration places in the namespace. Pods still receive those credentials: the
+kubelet resolves `secretKeyRef` with its own authorization, not the
+deployer's.
 
 Trade-offs of this tighter option:
 
 - **New kinds need an RBAC change.** Each kind the chart adds needs a
-  cluster-administrator change: HPA, PDB, Ingress, CronJob, the migration Job
-  (with `pods/log` read), and custom resources such as `ExternalSecret`. The
-  chart tests fail until the role covers every rendered kind, so the gap shows
-  up in a pull request, not in a failed deployment.
+  cluster-administrator change, for example an Ingress, or custom resources
+  such as `ExternalSecret`. The chart tests fail until the role covers every
+  rendered kind, so the gap shows up in a pull request, not in a failed
+  deployment.
 - **Release history is readable.** Anyone who can read ConfigMaps in the
   namespace can read Helm's release history. This is acceptable because values
   and manifests never contain credentials.
 - **The driver is hard to change later.** Changing Helm's storage driver later
   means migrating release history, so choose it before the first install.
+
+### Application secrets
+
+Uploading a secret to AWS Secrets Manager does **not** make it available to a
+workload. These are separate steps with separate owners.
+
+1. **Upload, by an operator.** `scripts/load_secrets.py` writes one secret per
+   environment, `/mobile-api/<environment>/runtime`, holding the JSON keys
+   `DATABASE_URL` and `PAYMENTS_WEBHOOK_SECRET`.
+   - **Where it runs:** in the operator's own trusted terminal, signed in with
+     an AWS SSO profile. Never in CI, the pipeline, or an AI agent's terminal.
+   - **How values are handled:** each value is typed twice at a hidden prompt
+     and sent straight to Secrets Manager. Values never appear in arguments,
+     environment variables, files, or output.
+   - **Safeguards:** it refuses to run without an interactive terminal,
+     confirms the AWS account and the destination name, ignores endpoint
+     overrides, never reads a value back, and suppresses SDK logs and raw
+     errors.
+   - **Operator IAM:** `secretsmanager:DescribeSecret`, plus `CreateSecret` to
+     create or `PutSecretValue` to replace, scoped to that environment's secret
+     names, plus KMS permissions if a customer-managed key is used.
+   - **Unconfirmed writes:** if AWS doesn't confirm a write, the tool prints the
+     version token it used. Check that version with `ListSecretVersionIds`
+     before writing again.
+   - **Limits:** values exist in the process's memory while being sent. A
+     compromised workstation or a recorded terminal session can still expose
+     them.
+2. **Sync, by the cluster's existing integration (assumed).**
+   - **What we assume:** the platform runs External Secrets Operator,
+     authenticated with EKS Pod Identity. It maintains a Kubernetes Secret
+     `mobile-api-runtime` in each environment's namespace, holding the same two
+     keys from `/mobile-api/<environment>/runtime`, and refreshes it on its
+     configured interval.
+   - **Permissions:** only its role holds `secretsmanager:GetSecretValue`, and
+     only on `/mobile-api/<environment>/*`.
+   - **Ownership:** neither this chart nor the pipeline manages it.
+   - **If the integration differs** (for example the Secrets Store CSI driver),
+     only `runtimeSecret.name` and the restart behaviour below change.
+3. **Consume, through the chart.**
+   - **How:** with `runtimeSecret.name: mobile-api-runtime`, the API container
+     reads both keys as environment variables through `secretKeyRef`. The batch
+     reads only `DATABASE_URL`.
+   - **What's in Git:** only the Secret's name and key names appear in values
+     or manifests.
+   - **The demo:** leaves the name empty and needs no secrets.
+
+**After a secret changes:**
+
+- **API:** environment variables are read when a container starts. Once the
+  Kubernetes Secret shows the new version, restart the API with `kubectl
+  rollout restart deployment/mobile-api -n <namespace>`. This is a normal
+  rolling update with `maxUnavailable: 0`.
+- **Batch:** the next Job reads the new value. A Job already running keeps the
+  old one.
+- **Rotation:** rotating a database password therefore needs a period where
+  both old and new passwords work, until every pod has restarted. The
+  webhook-secret rotation procedure depends on the payment-provider contract
+  (section 7).
+
+None of the pipeline roles can read application secrets. They have no
+`GetSecretValue`, and the deployer role has no Kubernetes Secrets access.
 
 ## 3. Networking for a private EKS API endpoint
 
@@ -236,6 +312,21 @@ findings block again.
 `python:3.13-slim`, and lists Python as a supported language. That it detects
 the pip-installed packages in this image is not yet confirmed. Check the first
 scan's inventory for `fastapi` and `uvicorn`.
+
+**Local evidence, and a decision this forces.** Trivy 0.76.1 (a local stand-in;
+Inspector's results will differ) scanned the demo image on 2026-10-28:
+
+- **Critical:** none.
+- **High, fixable:** none. Five came from pip's vendored libraries; pip is now
+  removed from the runtime image.
+- **High, unfixable:** 44, all in Debian base-image packages with no fixed
+  version (util-linux, ncurses, systemd libraries, perl-base).
+
+Under the rule above, every release would block until each unfixable finding
+has an owned, expiring exception. The choice is between keeping that strict
+rule, with per-CVE exceptions renewed as Debian ships fixes, or blocking only
+findings with a fix available, while tracking unfixable ones on the dashboard.
+This is listed in section 7.
 
 ### Source analysis: Amazon Inspector Code Security
 
@@ -379,7 +470,7 @@ destination, which is still unresolved:
 | Class | SNS topic | Examples |
 | --- | --- | --- |
 | **Urgent:** customer or business impact now. Production only, at any hour. | `mobile-api-production-urgent` | SLO fast burn. Canary failing twice in a row. Healthy targets below minimum. Webhook processing failures or lag over threshold (payments not completing). Batch not finished by its deadline. Failed production verification whose rollback also failed. |
-| **Working hours:** investigate, no immediate impact. | `mobile-api-<env>-ops` | SLO slow burn. Restarts or OOM kills. CPU or memory near requests. Rising database pool waits. Batch slower than usual but within its deadline. Staging deploy or verify failures. Validation build failures. Image-gate failures. New critical finding on a running image. |
+| **Working hours:** investigate, no immediate impact. | `mobile-api-<env>-ops` | SLO slow burn. HPA held at maxReplicas (capacity, or the database connection budget). A failed batch Job that can still finish within its deadline. Restarts or OOM kills. CPU or memory near requests. Rising database pool waits. Batch slower than usual but within its deadline. Staging deploy or verify failures. Validation build failures. Image-gate failures. New critical finding on a running image. |
 
 Staging alarms go only to the working-hours topic. Thresholds use rates rather
 than counts, because overnight traffic is a tenth of peak. A missing canary
@@ -401,8 +492,13 @@ data point counts as breaching; missing 5xx data does not.
   - pool size per pod times maximum replicas;
   - whether a pooler or RDS Proxy is needed;
   - whether Postgres is RDS, which determines the AWS metrics available.
-- **Batch deadline.** When the daily job must finish, and which key identifies
-  a business period.
+- **Batch contract.**
+  - production schedule and time zone;
+  - business-date semantics (the demo defaults to the current UTC date);
+  - expected duration;
+  - completion deadline;
+  - which key identifies a business period for safe replay.
+- **Image-gate policy for unfixable base-image CVEs** (section 4).
 - **Operational destination.** Where SNS delivers, and who is on call.
 - **Platform:**
   - one cluster with two namespaces, or separate clusters;
@@ -416,8 +512,9 @@ data point counts as breaching; missing 5xx data does not.
 
 | Item | State |
 | --- | --- |
-| Chart, environment values, demo application | Implemented. Chart linted, rendered, and schema-validated. Demo run natively. Not installed on a cluster. |
-| Chart tests, smoke test, secret scan, validation buildspec | Implemented and run locally. The buildspec has not run in CodeBuild. |
+| Chart (API, HPA, PDB, CronJob, secret references) and environment values | Implemented. Linted, rendered, schema-validated, and relationship-checked. Not installed on a cluster. |
+| Demo application and container image | Implemented. Unit-tested, built, and checked locally with Podman under the chart's restrictions. Not pushed to any registry. |
+| Chart, app, and secrets-loader tests; container check; smoke test; secret scan; validation buildspec | Implemented and run locally. The buildspec has not run in CodeBuild. |
+| Secrets loader (`scripts/load_secrets.py`) | Implemented. Offline tests only. Never run against AWS. |
 | Deployer RBAC (`platform/deploy-rbac.yaml`) | Written, schema-validated, and checked against the rendered chart. Not applied to any cluster. |
-| Container image | Built and run locally with Podman under the chart's restrictions. Not pushed to any registry. |
 | Everything else in this document | Proposed only |
