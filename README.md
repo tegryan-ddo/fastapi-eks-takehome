@@ -8,17 +8,15 @@ of that overnight.
 
 ## Status
 
-This is the first increment: the repository, a runnable container, and the
-basic Helm deployment.
-
 | Area | Status |
 | --- | --- |
 | Smoke-test app | Done; run natively on Python 3.14.2 with the pinned dependencies and the Dockerfile's Uvicorn command |
 | Container image | Dockerfile written; **image not yet built or run** (no container runtime was available) |
-| Chart: Deployment, ClusterIP Service, ServiceAccount | Done, linted and rendered; **not yet installed on a cluster** |
+| Chart: Deployment, ClusterIP Service, ServiceAccount | Done, linted, rendered, and schema-validated; **not yet installed on a cluster** |
 | Staging and production values | Minimal (replica counts only) |
+| Verification: chart tests, smoke test, secret scan, validation buildspec | Done and run locally; buildspec not yet run in CodeBuild |
+| Delivery and monitoring (AWS CodePipeline, CodeBuild, CloudWatch) | Proposal only: [docs/operations.md](docs/operations.md) |
 | Ingress and TLS, secrets, autoscaling, disruption budget, topology spread, daily CronJob | Not started |
-| Delivery and monitoring write-ups | Not started |
 
 Reasons and assumptions are in [docs/decisions.md](docs/decisions.md).
 
@@ -32,7 +30,12 @@ charts/mobile-api/            Helm application chart
 environments/staging.yaml     staging overrides
 environments/production.yaml  production overrides
 examples/demo-api/            smoke-test FastAPI app and its Dockerfile
+tests/chart/                  chart lint, schema, and relationship checks (pytest)
+scripts/                      pinned tool downloads, smoke test, secret scan
+buildspecs/validate.yml       CodeBuild validation build (proposed, not run in AWS)
 docs/decisions.md             assumptions and reasons for consequential choices
+docs/operations.md            delivery and monitoring proposal (AWS)
+docs/verification.md          what each check catches; staging acceptance plan
 ```
 
 ## The demo application
@@ -52,7 +55,9 @@ application needs.
 ## Prerequisites
 
 - Docker 24 or later. Podman also works; replace `docker` with `podman`.
-- Helm 3.x or 4.x. Verified with Helm 3.22.1 and 4.3.1.
+- Helm 3.x or 4.x. Verified with Helm 3.22.1 and 4.3.1. The verification
+  commands below download their own pinned Helm.
+- Python 3.12 or later for the verification commands.
 - `curl`.
 - A POSIX shell (bash, zsh, or Git Bash on Windows). Run commands from the
   repository root.
@@ -85,6 +90,12 @@ curl -i http://localhost:8000/health/live
 curl -i http://localhost:8000/health/ready
 ```
 
+Or run the smoke test, which waits for readiness and checks the response:
+
+```sh
+python scripts/smoke_test.py http://localhost:8000 --expect-version 0.1.0
+```
+
 Stop the container. It is removed automatically because it was started with
 `--rm`.
 
@@ -113,6 +124,23 @@ DIGEST=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 helm template mobile-api charts/mobile-api -f environments/production.yaml \
   --set image.digest=$DIGEST
 ```
+
+## Verify
+
+```sh
+python -m pip install -r requirements-dev.txt
+
+# Chart: lint both environments, render, validate against Kubernetes 1.30
+# schemas, and check selectors, ports, image reference, security settings
+python -m pytest
+
+# Secrets: Git history and working-tree files, findings redacted
+python scripts/secret_scan.py
+```
+
+The first run downloads pinned, checksum-verified Helm, kubeconform, and
+gitleaks binaries into `.tools/`. See [docs/verification.md](docs/verification.md)
+for what each check catches and the staging acceptance plan.
 
 ## How Helm combines values
 

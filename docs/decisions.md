@@ -147,11 +147,8 @@ this sleep need to be tuned together.
   `component: batch`, not inside API containers. It needs
   `concurrencyPolicy: Forbid`, deadlines, retry limits, and its own resources.
   Whether it reuses the API image is still open.
-- **Delivery plan** (written): build, scan, and push to ECR; promote by digest
-  from staging to production; `helm upgrade` with `--wait` and rollback on
-  failure.
-- **Monitoring plan** (written): request rate, error rate, and latency; logs;
-  CronJob success; webhook failures; alerts.
+- **Delivery and monitoring plans**: proposed in
+  [operations.md](operations.md). Nothing is provisioned yet.
 
 Also not addressed yet: pinning the base image by digest, image vulnerability
 scanning, NetworkPolicy, and multi-arch builds.

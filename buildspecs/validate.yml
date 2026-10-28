@@ -1,0 +1,34 @@
+# Validation build for branches and pull requests: chart checks and secret scan.
+# Proposed CodeBuild configuration; not yet provisioned or run in AWS.
+#   Image: aws/codebuild/amazonlinux-x86_64-standard:6.0 (provides Python 3.14)
+#   Source: GitHub through CodeConnections, full clone depth so the secret scan
+#           covers Git history. A shallow or zip source gets a files-only scan.
+#   Network: outbound HTTPS to get.helm.sh, github.com, and
+#            raw.githubusercontent.com (pinned tools and Kubernetes schemas).
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.14
+    commands:
+      - python -m pip install --no-cache-dir -r requirements-dev.txt
+      - python scripts/tools.py
+  build:
+    commands:
+      # Run every check before failing, so one failure does not hide another,
+      # and exit non-zero if any check failed so the build fails.
+      - |
+        status=0
+        python -m pytest --junitxml=reports/junit.xml || status=1
+        python scripts/secret_scan.py || status=1
+        exit $status
+
+reports:
+  chart-checks:
+    files:
+      - reports/junit.xml
+    file-format: JUNITXML
