@@ -1,0 +1,30 @@
+# One-off database bootstrap, run by the "mobile-api-db-admin" CodeBuild
+# project inside the VPC (infra/): creates the application role using the
+# master account. All inputs are filled by CodeBuild from Secrets Manager and
+# are never printed.
+#
+# Run it once after `scripts/load_secrets.py` has stored DATABASE_URL, and
+# again whenever the application password in that secret changes.
+version: 0.2
+
+env:
+  shell: bash
+  secrets-manager:
+    PGHOST: "/mobile-api/staging/rds-master:host"
+    PGPORT: "/mobile-api/staging/rds-master:port"
+    PGDATABASE: "/mobile-api/staging/rds-master:dbname"
+    PGMASTER_USER: "/mobile-api/staging/rds-master:username"
+    PGMASTER_PASSWORD: "/mobile-api/staging/rds-master:password"
+    APP_DATABASE_URL: "/mobile-api/staging/runtime:DATABASE_URL"
+  variables:
+    DATABASE_CA_BUNDLE: examples/demo-api/certs/rds-global-bundle.pem
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.13
+    commands:
+      - python -m pip install --no-cache-dir -r requirements-dev.txt
+  build:
+    commands:
+      - python platform/db/bootstrap_app_user.py

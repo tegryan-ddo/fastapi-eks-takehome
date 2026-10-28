@@ -1,0 +1,58 @@
+# Release build: verify the commit, build the demo image, push it to ECR tagged
+# with the commit SHA, and print the resulting digest.
+#
+# Runs in the privileged "mobile-api-build" CodeBuild project defined in
+# infra/, triggered by pushes to main. The project sets ECR_REPOSITORY_URI.
+# A phase stops at its first failing command, so nothing is pushed unless every
+# check before the push passed.
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.13
+    commands:
+      - python -m pip install --no-cache-dir -r requirements-dev.txt
+      - python scripts/tools.py
+  pre_build:
+    commands:
+      - export COMMIT="$CODEBUILD_RESOLVED_SOURCE_VERSION"
+      - export CHART_APP_VERSION=$(python -c "import yaml; print(yaml.safe_load(open('charts/mobile-api/Chart.yaml'))['appVersion'])")
+      - export APP_VERSION="${CHART_APP_VERSION}-${COMMIT:0:7}"
+      - echo "Building commit $COMMIT as $ECR_REPOSITORY_URI:$COMMIT (APP_VERSION=$APP_VERSION)"
+      - aws ecr get-login-password | docker login --username AWS --password-stdin "${ECR_REPOSITORY_URI%%/*}"
+  build:
+    commands:
+      - python -m pytest --junitxml=reports/junit.xml
+      - python scripts/secret_scan.py
+      # Builds demo-api:verify and checks it under the chart's restrictions.
+      - python scripts/verify_container.py --engine docker --version "$APP_VERSION"
+      - docker tag demo-api:verify "$ECR_REPOSITORY_URI:$COMMIT"
+  post_build:
+    commands:
+      - |
+        # post_build also runs after a failed build phase; push only on success.
+        if [ "$CODEBUILD_BUILD_SUCCEEDING" != "1" ]; then
+          echo "A check failed; nothing was pushed"
+          exit 1
+        fi
+        REPO_NAME="${ECR_REPOSITORY_URI#*/}"
+        # Tags are immutable: a rebuild of the same commit keeps the existing image.
+        if aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag="$COMMIT" >/dev/null 2>&1; then
+          echo "Tag $COMMIT already exists; not pushing again"
+        else
+          docker push "$ECR_REPOSITORY_URI:$COMMIT"
+        fi
+        DIGEST=$(aws ecr describe-images --repository-name "$REPO_NAME" \
+          --image-ids imageTag="$COMMIT" --query 'imageDetails[0].imageDigest' --output text)
+        printf '{"commit":"%s","image":"%s@%s","app_version":"%s","chart_app_version":"%s"}\n' \
+          "$COMMIT" "$ECR_REPOSITORY_URI" "$DIGEST" "$APP_VERSION" "$CHART_APP_VERSION" | tee release.json
+
+reports:
+  verification:
+    files:
+      - reports/junit.xml
+    file-format: JUNITXML

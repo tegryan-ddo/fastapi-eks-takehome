@@ -1,0 +1,25 @@
+# CDK app dependencies. The CDK CLI is run separately: npx aws-cdk@2.1146.1
+aws-cdk-lib==2.275.0
+constructs==10.8.1
+
+# Transitive dependencies
+attrs==26.1.0
+aws-cdk-asset-awscli-v1==2.2.292
+aws-cdk-asset-node-proxy-agent-v6==2.1.3
+aws-cdk-cloud-assembly-schema==55.2.0
+cattrs==26.2.1
+jsii==1.142.0
+publication==0.0.3
+python-dateutil==3.0.0
+six==1.17.0
+typeguard==2.13.3
+typing-extensions==4.16.0
+tzdata==2026.6
+
+# Tests (python -m pytest infra)
+pytest==9.2.0
+colorama==0.4.6 ; sys_platform == "win32"
+iniconfig==2.3.1
+packaging==26.3
+pluggy==1.7.0
+pygments==2.21.0

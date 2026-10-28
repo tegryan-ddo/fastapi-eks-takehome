@@ -15,13 +15,15 @@ __pycache__/
 venv/
 .pytest_cache/
 
-# Build output, packaged charts, downloaded tools, test reports
+# Build output, packaged charts, downloaded tools, test reports, CDK output
 build/
 dist/
 *.tgz
 charts/*/charts/
 .tools/
 reports/
+cdk.out/
+release.json
 
 # Editors and OS
 .vscode/
