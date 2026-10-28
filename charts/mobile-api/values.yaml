@@ -3,27 +3,40 @@
 #
 # Demo application assumption: only the assignment brief was supplied. The
 # image built from examples/demo-api demonstrates container startup, health
-# checks, shutdown, and batch execution. Postgres access, payment-provider
-# integration, real batch behaviour, and production throughput are unverified.
+# checks, shutdown, real PostgreSQL reads and writes, schema migration, and
+# batch execution. Payment-provider integration, the real business logic, and
+# production throughput are unverified.
 
 image:
-  # Placeholder ECR repository; replace with the real registry.
-  repository: 123456789012.dkr.ecr.us-east-1.amazonaws.com/mobile-api
+  # The ECR repository provisioned by infra/ in this exercise's AWS account.
+  repository: 882384879235.dkr.ecr.us-east-1.amazonaws.com/mobile-api
   # Used when digest is empty. Defaults to the chart's appVersion.
   tag: ""
   # Full digest, e.g. "sha256:<64 hex characters>". Takes precedence over tag
-  # for both the API Deployment and the batch CronJob.
+  # for the API Deployment, the batch CronJob, and the migration Job.
   digest: ""
   pullPolicy: IfNotPresent
 
-# Kubernetes Secret created in the namespace by the cluster's secrets
+# Kubernetes Secret in the namespace, created by the cluster's secrets
 # integration from AWS Secrets Manager (see docs/operations.md). The chart only
-# references it by name. Empty for the demo, which needs no secrets.
+# references it by name; a Secret name is not a credential. PostgreSQL is
+# required: every workload reads DATABASE_URL from this Secret, and the
+# release fails if the Secret is missing.
 runtimeSecret:
-  name: ""
+  name: mobile-api-runtime
 
 service:
   port: 80
+
+# Off by default. The host and the ALB certificate differ per environment and
+# are supplied at deploy time through an extra values file; see the example
+# in environments/staging.yaml. TLS terminates at the ALB, configured through
+# annotations, so the Ingress has no spec.tls.
+ingress:
+  enabled: false
+  className: alb
+  host: ""
+  annotations: {}
 
 api:
   # Used only when autoscaling.enabled is false.
@@ -40,11 +53,14 @@ api:
     limits:
       memory: 512Mi
 
-  # Keys of runtimeSecret exposed as environment variables when it is set.
+  # Keys of runtimeSecret exposed as environment variables.
   secretKeys: [DATABASE_URL, PAYMENTS_WEBHOOK_SECRET]
 
-  # Startup and liveness use /health/live, which must never depend on Postgres
-  # or other external services. Readiness gates traffic.
+  # Startup and liveness use /health/live, which never touches PostgreSQL.
+  # Readiness gates traffic: it runs a pooled SELECT 1 with a 1.5s budget, so
+  # timeoutSeconds 2 covers it. Two failures five seconds apart take a pod out
+  # of rotation in about 10s, and it returns automatically once the database
+  # answers again.
   startupProbe:
     httpGet:
       path: /health/live
@@ -76,7 +92,8 @@ autoscaling:
   # HPA assumption: CPU utilization is the initial HPA signal. Confirm or
   # refine it with the app team and representative load tests; database or
   # I/O waits may increase latency without increasing CPU. maxReplicas must
-  # fit the Postgres connection budget. Requires the Kubernetes resource
+  # fit the Postgres connection budget: each pod holds up to
+  # DATABASE_POOL_MAX (5) connections. Requires the Kubernetes resource
   # metrics API (metrics-server) in the cluster.
   enabled: true
   minReplicas: 2
@@ -85,6 +102,20 @@ autoscaling:
 
 podDisruptionBudget:
   maxUnavailable: 1
+
+# Schema migration, run as a Helm pre-install/pre-upgrade hook Job before any
+# API or batch pod changes. Never run from API pods or health endpoints.
+migrate:
+  secretKeys: [DATABASE_URL]
+  activeDeadlineSeconds: 600
+  # Failed hook Jobs stay for diagnosis, then are removed after a day.
+  ttlSecondsAfterFinished: 86400
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      memory: 128Mi
 
 batch:
   # Assumptions to confirm with the application team: schedule, time zone,

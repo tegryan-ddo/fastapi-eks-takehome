@@ -29,7 +29,11 @@ rules:
   - apiGroups: [policy]
     resources: [poddisruptionbudgets]
     verbs: [get, list, watch, create, update, patch, delete]
-  # CronJob from the chart; Jobs for manual staging runs created from it.
+  - apiGroups: [networking.k8s.io]
+    resources: [ingresses]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # CronJob from the chart; Jobs for the migration hook and for manual staging
+  # runs created from the CronJob.
   - apiGroups: [batch]
     resources: [cronjobs, jobs]
     verbs: [get, list, watch, create, update, patch, delete]

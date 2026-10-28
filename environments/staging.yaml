@@ -6,3 +6,18 @@ batch:
   # Verify business output and safe replay against staging data before promotion.
   # Manual Jobs are outside this CronJob's Forbid concurrency protection.
   suspend: true
+
+# Ingress stays off here. The deploy step enables it through an extra values
+# file that supplies the host and the ACM certificate, for example on an EKS
+# Auto Mode cluster (the HTTP listener exists only to redirect to HTTPS):
+#
+# ingress:
+#   enabled: true
+#   className: alb
+#   host: staging.mobile-api.example.com
+#   annotations:
+#     alb.ingress.kubernetes.io/scheme: internet-facing
+#     alb.ingress.kubernetes.io/target-type: ip
+#     alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+#     alb.ingress.kubernetes.io/ssl-redirect: "443"
+#     alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:<region>:<account>:certificate/<id>

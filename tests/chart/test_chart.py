@@ -4,8 +4,6 @@ deployer RBAC in platform/ can deploy the chart without broad permissions.
 
     python -m pytest tests/chart
 
-When an Ingress is added, extend the relationship checks: its backends must
-name the Service and its port.
 """
 
 import json
@@ -28,15 +26,22 @@ CHART_YAML = yaml.safe_load((CHART / "Chart.yaml").read_text())
 VALUES = yaml.safe_load((CHART / "values.yaml").read_text())
 REPOSITORY = VALUES["image"]["repository"]
 DIGEST = "sha256:" + "0" * 64
-RUNTIME_SECRET = "mobile-api-runtime"
-# Each workload gets only the keys it needs; the batch job has no webhook secret.
-EXPECTED_SECRET_KEYS = {"api": {"DATABASE_URL", "PAYMENTS_WEBHOOK_SECRET"}, "batch": {"DATABASE_URL"}}
+RUNTIME_SECRET = VALUES["runtimeSecret"]["name"]
+# Everything the chart can render: the Ingress is off by default.
+ALL_KINDS = ("ingress.enabled=true", "ingress.host=staging.example.test")
+# Each workload gets only the keys it needs; only the API handles webhooks.
+EXPECTED_SECRET_KEYS = {
+    "api": {"DATABASE_URL", "PAYMENTS_WEBHOOK_SECRET"},
+    "batch": {"DATABASE_URL"},
+    "migrate": {"DATABASE_URL"},
+}
 
-# The demo application's actual endpoints and batch entry point
-# (examples/demo-api/app/main.py and app/batch.py).
+# The demo application's actual endpoints and entry points
+# (examples/demo-api/app/main.py, app/batch.py, app/migrate.py).
 LIVE_PATH = "/health/live"
 READY_PATH = "/health/ready"
 BATCH_COMMAND = ["python", "-m", "app.batch"]
+MIGRATE_COMMAND = ["python", "-m", "app.migrate"]
 
 MANAGE_VERBS = {"get", "list", "watch", "create", "update", "patch", "delete"}
 FORBIDDEN_RESOURCES = {"secrets", "pods/exec", "pods/attach", "pods/portforward"}
@@ -69,8 +74,16 @@ def batch_pod(resources):
     return resources["CronJob"]["spec"]["jobTemplate"]["spec"]["template"]
 
 
+def migrate_pod(resources):
+    return resources["Job"]["spec"]["template"]
+
+
 def workload_pods(resources):
-    return {"api": api_pod(resources)["spec"], "batch": batch_pod(resources)["spec"]}
+    return {
+        "api": api_pod(resources)["spec"],
+        "batch": batch_pod(resources)["spec"],
+        "migrate": migrate_pod(resources)["spec"],
+    }
 
 
 def container(pod_spec):
@@ -117,18 +130,22 @@ def test_helm_lint(env):
     assert result.returncode == 0, f"helm lint failed for {env}:\n{result.stdout}{result.stderr}"
 
 
+@pytest.mark.parametrize("overrides", [(), ALL_KINDS], ids=["defaults", "with-ingress"])
 @pytest.mark.parametrize("env", ENVIRONMENTS)
-def test_rendered_resources_match_kubernetes_schema(env, tmp_path):
+def test_rendered_resources_match_kubernetes_schema(env, overrides, tmp_path):
     rendered = tmp_path / f"{env}.yaml"
-    rendered.write_text(helm_template(env, f"runtimeSecret.name={RUNTIME_SECRET}"))
+    rendered.write_text(helm_template(env, *overrides))
     kubeconform(rendered)
 
 
 @pytest.mark.parametrize("env", ENVIRONMENTS)
-def test_api_selectors_select_api_pods_and_exclude_batch_pods(env):
+def test_api_selectors_select_api_pods_only(env):
     resources = manifests(env)
     api_labels = api_pod(resources)["metadata"]["labels"]
-    batch_labels = batch_pod(resources)["metadata"]["labels"]
+    other_labels = {
+        "batch": batch_pod(resources)["metadata"]["labels"],
+        "migrate": migrate_pod(resources)["metadata"]["labels"],
+    }
     selectors = {
         "Service": resources["Service"]["spec"]["selector"],
         "Deployment": resources["Deployment"]["spec"]["selector"]["matchLabels"],
@@ -139,8 +156,9 @@ def test_api_selectors_select_api_pods_and_exclude_batch_pods(env):
     for owner, selector in selectors.items():
         if not selector.items() <= api_labels.items():
             problems.append(f"{owner} selector {selector} does not match the API pod labels")
-        if selector.items() <= batch_labels.items():
-            problems.append(f"{owner} selector {selector} also matches batch pods")
+        for name, labels in other_labels.items():
+            if selector.items() <= labels.items():
+                problems.append(f"{owner} selector {selector} also matches {name} pods")
         if selector.get("app.kubernetes.io/component") != "api":
             problems.append(f"{owner} selector must include app.kubernetes.io/component=api")
         if "app.kubernetes.io/instance" not in selector:
@@ -178,15 +196,18 @@ def test_service_and_probes_target_the_http_container_port(env):
     ],
     ids=["default-tag", "explicit-tag", "digest", "digest-wins-over-tag"],
 )
-def test_api_and_batch_use_the_same_image_reference(overrides, expected):
+def test_every_workload_uses_the_same_image_reference(overrides, expected):
     resources = manifests("production", *overrides)
     images = {name: container(pod)["image"] for name, pod in workload_pods(resources).items()}
-    assert images == {"api": expected, "batch": expected}, f"With --set {list(overrides)}: expected {expected}, rendered {images}"
+    assert images == dict.fromkeys(workload_pods(resources), expected), (
+        f"With --set {list(overrides)}: expected {expected} for every workload, rendered {images}"
+    )
 
 
 @pytest.mark.parametrize("env", ENVIRONMENTS)
 def test_workload_security_settings(env):
     resources = manifests(env)
+    chart_sa = resources["ServiceAccount"]["metadata"]["name"]
     problems = []
     for name, pod in workload_pods(resources).items():
         pod_security = pod.get("securityContext", {})
@@ -210,7 +231,11 @@ def test_workload_security_settings(env):
             problems.append(f"{name}: readOnlyRootFilesystem must be true")
         if pod.get("automountServiceAccountToken") is not False:
             problems.append(f"{name}: automountServiceAccountToken must be false; the workloads do not call Kubernetes")
-        if pod.get("serviceAccountName") != resources["ServiceAccount"]["metadata"]["name"]:
+        if name == "migrate":
+            # A pre-install hook runs before the chart's ServiceAccount exists.
+            if pod.get("serviceAccountName") not in (None, "default"):
+                problems.append(f"{name}: hook pod must use the namespace default ServiceAccount")
+        elif pod.get("serviceAccountName") != chart_sa:
             problems.append(f"{name}: pod must use the chart's dedicated ServiceAccount")
     assert not problems, f"{env}:\n  " + "\n  ".join(problems)
 
@@ -302,10 +327,40 @@ def test_cronjob_runs_the_batch_command_with_bounded_settings(env):
 
 
 @pytest.mark.parametrize("env", ENVIRONMENTS)
-def test_secrets_are_referenced_never_embedded(env):
-    assert "secretKeyRef" not in helm_template(env), "With no runtimeSecret.name, nothing may reference a Secret"
+def test_migration_runs_once_as_a_helm_hook_before_workloads_change(env):
+    job = manifests(env)["Job"]
+    annotations = job["metadata"].get("annotations", {})
+    spec = job["spec"]
+    pod = spec["template"]["spec"]
 
-    pods = workload_pods(manifests(env, f"runtimeSecret.name={RUNTIME_SECRET}"))
+    problems = []
+    if annotations.get("helm.sh/hook") != "pre-install,pre-upgrade":
+        problems.append(f"helm.sh/hook must be pre-install,pre-upgrade, not {annotations.get('helm.sh/hook')!r}")
+    policies = set(annotations.get("helm.sh/hook-delete-policy", "").split(","))
+    if not {"before-hook-creation", "hook-succeeded"} <= policies:
+        problems.append(f"hook-delete-policy must include before-hook-creation and hook-succeeded, not {sorted(policies)}")
+    if "hook-failed" in policies:
+        problems.append("a failed migration Job must be kept for diagnosis, not deleted by hook-failed")
+    if container(pod)["command"] != MIGRATE_COMMAND:
+        problems.append(f"migrate container must run {MIGRATE_COMMAND}, not {container(pod).get('command')}")
+    if spec.get("backoffLimit") != 0:
+        problems.append("backoffLimit must be 0: the command is idempotent and the next release retries")
+    if pod.get("restartPolicy") != "Never":
+        problems.append("restartPolicy must be Never")
+    for field in ("activeDeadlineSeconds", "ttlSecondsAfterFinished"):
+        if not isinstance(spec.get(field), int):
+            problems.append(f"{field} must be an explicit integer")
+    assert not problems, f"{env}:\n  " + "\n  ".join(problems)
+
+
+@pytest.mark.parametrize("env", ENVIRONMENTS)
+def test_secrets_are_referenced_never_embedded(env):
+    assert "secretKeyRef" not in helm_template(env, "runtimeSecret.name="), (
+        "With an empty runtimeSecret.name, nothing may reference a Secret"
+    )
+
+    pods = workload_pods(manifests(env))
+    assert set(pods) == set(EXPECTED_SECRET_KEYS), "every workload needs an expected-keys entry"
     for name, pod in pods.items():
         env_vars = container(pod).get("env", [])
         expected = EXPECTED_SECRET_KEYS[name]
@@ -318,6 +373,34 @@ def test_secrets_are_referenced_never_embedded(env):
             )
 
 
+@pytest.mark.parametrize("env", ENVIRONMENTS)
+def test_ingress_renders_only_when_enabled_and_targets_the_service(env):
+    assert "Ingress" not in manifests(env), "No Ingress may render while ingress.enabled is false"
+
+    resources = manifests(env, *ALL_KINDS)
+    ingress, service = resources["Ingress"], resources["Service"]
+    port_names = {p["name"] for p in service["spec"]["ports"]}
+    rules = ingress["spec"]["rules"]
+
+    problems = []
+    if ingress["spec"].get("ingressClassName") != VALUES["ingress"]["className"]:
+        problems.append(f"ingressClassName must be {VALUES['ingress']['className']!r}")
+    if "tls" in ingress["spec"]:
+        problems.append("spec.tls must be absent: TLS terminates at the ALB through annotations")
+    if len(rules) != 1 or rules[0].get("host") != "staging.example.test":
+        problems.append(f"expected one rule for the configured host, got {rules}")
+    paths = rules[0]["http"]["paths"] if rules else []
+    if [(p["path"], p["pathType"]) for p in paths] != [("/", "Prefix")]:
+        problems.append(f"expected a single Prefix rule for /, got {paths}")
+    for path in paths:
+        backend = path["backend"]["service"]
+        if backend["name"] != service["metadata"]["name"]:
+            problems.append(f"backend {backend['name']!r} is not the chart Service {service['metadata']['name']!r}")
+        if backend["port"].get("name") not in port_names:
+            problems.append(f"backend port {backend['port']} is not a named Service port ({sorted(port_names)})")
+    assert not problems, f"{env}:\n  " + "\n  ".join(problems)
+
+
 def test_deployer_rbac_matches_kubernetes_schema():
     kubeconform(DEPLOYER_RBAC)
 
@@ -325,8 +408,8 @@ def test_deployer_rbac_matches_kubernetes_schema():
 @pytest.mark.parametrize("env", ENVIRONMENTS)
 def test_deployer_can_manage_every_rendered_kind(env):
     role, _ = deployer_rbac()
-    needed = [("", "configmaps", "Helm release history"), ("batch", "jobs", "manual staging Jobs")]
-    for resource in manifests(env).values():
+    needed = [("", "configmaps", "Helm release history")]
+    for resource in manifests(env, *ALL_KINDS).values():
         kind = resource["kind"]
         plural = kind.lower() + ("es" if kind.endswith("s") else "s")
         needed.append((resource["apiVersion"].rpartition("/")[0], plural, kind))
