@@ -32,6 +32,7 @@ examples/demo-api/            smoke-test FastAPI app and its Dockerfile
 tests/chart/                  chart lint, schema, and relationship checks (pytest)
 scripts/                      pinned tool downloads, smoke test, secret scan
 buildspecs/validate.yml       CodeBuild validation build (proposed, not run in AWS)
+platform/deploy-rbac.yaml     Kubernetes RBAC for the deploy roles (proposed, not applied)
 docs/decisions.md             assumptions and reasons for consequential choices
 docs/operations.md            delivery and monitoring proposal (AWS)
 docs/verification.md          what each check catches; staging acceptance plan
@@ -133,7 +134,8 @@ helm template mobile-api charts/mobile-api -f environments/production.yaml \
 python -m pip install -r requirements-dev.txt
 
 # Chart: lint both environments, render, validate against Kubernetes 1.30
-# schemas, and check selectors, ports, image reference, security settings
+# schemas, and check selectors, ports, image reference, security settings,
+# and that platform/deploy-rbac.yaml can deploy the chart
 python -m pytest
 
 # Secrets: Git history and working-tree files, findings redacted

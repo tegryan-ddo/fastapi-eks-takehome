@@ -26,7 +26,7 @@ Kubernetes JSON schemas from GitHub when it runs.
 
 | Command | Checks | Fails when |
 | --- | --- | --- |
-| `python -m pytest` | Chart: `helm lint --strict` for staging and production; render both; validate against Kubernetes 1.30 schemas, taken from `kubeVersion` in `Chart.yaml`, with kubeconform `-strict`; check relationships between resources. | Lint errors. Template errors. Misspelled or misplaced fields, or fields not in Kubernetes 1.30. Any relationship below broken. |
+| `python -m pytest` | Chart: `helm lint --strict` for staging and production; render both; validate against Kubernetes 1.30 schemas, taken from `kubeVersion` in `Chart.yaml`, with kubeconform `-strict`; check relationships between resources and the deployer RBAC. | Lint errors. Template errors. Misspelled or misplaced fields, or fields not in Kubernetes 1.30. Any relationship below broken. |
 | `python scripts/smoke_test.py <base-url>` | A running service, local or through the staging HTTPS hostname: readiness within a deadline, liveness, and the identity returned by `GET /`. | Not ready by the deadline. A non-200 response. The wrong service name or version. Connection, TLS, or timeout errors. |
 | `python scripts/secret_scan.py` | gitleaks over **both** Git history (all commits reachable from local refs) and the working-tree files Git would track. Findings are redacted. | Any secret found. It also reports a scanner error separately from a clean result. |
 
@@ -47,6 +47,8 @@ These are relationships a schema validator cannot see:
 | Pod `runAsNonRoot`, non-zero UID, `RuntimeDefault` seccomp; container blocks privilege escalation, is not privileged, drops ALL capabilities and adds none, and has a read-only root filesystem; service-account token not mounted; the chart's own ServiceAccount used | Regressions in the workload security settings chosen in `decisions.md`. |
 | `/tmp` mounted from an `emptyDir` | A read-only root filesystem with nowhere to write temporary files. |
 | preStop sleep plus Uvicorn's graceful shutdown (read from the Dockerfile `CMD`) is less than `terminationGracePeriodSeconds` | Pods killed mid-request during rollouts because the grace period is too short. |
+| `platform/deploy-rbac.yaml` passes schema validation and grants full management of every kind the chart renders, plus ConfigMaps for Helm history | A chart change that would fail in the pipeline with "forbidden" because the deployer role was not extended. |
+| The deployer role has no wildcards, Secrets, pod `exec`, `attach`, or `port-forward`, impersonation, or RBAC rights; it is granted only through namespaced RoleBindings; each environment has its own group | Permission creep. A ClusterRoleBinding granting every namespace. One deploy role able to deploy to both environments. |
 
 Each check was confirmed to fail, with its message, against a deliberately
 broken copy of the chart.

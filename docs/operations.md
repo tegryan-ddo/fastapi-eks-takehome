@@ -42,7 +42,7 @@ Production image-gate (re-check) → deploy-production           production depl
 Both deploy projects run the same command, using files from R only:
 
 ```sh
-helm upgrade --install mobile-api ./mobile-api-*.tgz \
+HELM_DRIVER=configmap helm upgrade --install mobile-api ./mobile-api-*.tgz \
   --namespace "$NAMESPACE" \
   -f "values/$ENVIRONMENT.yaml" -f release-values.yaml \
   --rollback-on-failure --wait=watcher --timeout 10m --history-max 20
@@ -52,7 +52,9 @@ These are Helm 4 flags. In Helm 4, `--rollback-on-failure` replaces
 `--atomic`, and without it `upgrade` does not wait for resources. With Helm 3,
 use `--atomic --wait`. `CLUSTER_NAME`, `NAMESPACE`, and `ENVIRONMENT` are fixed
 in each deploy project's configuration, not taken from the artifact, so a
-release cannot redirect itself to another environment.
+release cannot redirect itself to another environment. The namespaces are
+`mobile-api-staging` and `mobile-api-production`. `HELM_DRIVER=configmap` is
+explained in section 2.
 
 **No rebuild, no re-fetch.** Promotion reuses R and D. The deploy projects
 never build an image and never read Git, so production receives exactly the
@@ -118,25 +120,56 @@ production role. The CodePipeline service role may start these projects, use
 the CodeConnections connection, read and write artifacts, and publish approval
 notifications.
 
-**Kubernetes authorization** uses EKS access entries. The cluster's
-authentication mode must be `API` or `API_AND_CONFIG_MAP`, which is an
-assumption. Each deploy role gets an access entry associated with
-`AmazonEKSEditPolicy`, scoped to its own namespace. That policy covers
-everything the chart manages now or will add: Deployments, Services,
-ServiceAccounts, Jobs and CronJobs, HPAs, PDBs, Ingresses, and ConfigMaps. It
-also covers Secrets, which Helm needs because it stores release history as
-Secrets in the release namespace.
+**Kubernetes authorization** uses EKS access entries mapped to Kubernetes
+RBAC. The cluster's authentication mode must be `API` or
+`API_AND_CONFIG_MAP`, which is an assumption. Each deploy role gets a standard
+access entry with `kubernetesGroups` set to its environment's group:
+`mobile-api-staging-deployers` or `mobile-api-production-deployers`. No EKS
+access policy is associated, so
+[`platform/deploy-rbac.yaml`](../platform/deploy-rbac.yaml) is the role's only
+Kubernetes permission.
 
-The policy does not cover RBAC objects, cluster-scoped resources, creating
-namespaces, or custom resources such as an `ExternalSecret`. Namespaces are
-therefore created once by the platform team, and the pipeline never passes
-`--create-namespace`. If the chart adds custom resources, map the role to a
-Kubernetes group through the access entry's `kubernetesGroups` and bind a
-namespaced Role.
+That file holds one `ClusterRole`, which grants nothing by itself. It is bound
+by a `RoleBinding` in each environment's namespace, so each group can act only
+in its own namespace. The role allows:
 
-That group-plus-Role mapping is also the way to tighten permissions before
-production. The Edit policy allows impersonating any service account in the
-namespace, and `exec` and `port-forward` into pods.
+- full management of only the kinds the chart renders: ServiceAccounts,
+  Services, and Deployments;
+- ConfigMaps, for Helm's release history;
+- read-only access to ReplicaSets, Pods, and Events, to wait for and verify
+  rollouts.
+
+It does not allow:
+
+- Secrets;
+- RBAC objects;
+- pod `exec`, `attach`, or `port-forward`;
+- service-account impersonation;
+- cluster-scoped resources, including creating namespaces.
+
+A cluster administrator creates the namespaces and applies the RBAC once. The
+pipeline never passes `--create-namespace` and cannot change its own
+permissions. This is tighter than the managed `AmazonEKSEditPolicy`, which
+would also allow Secrets, `exec`, `port-forward`, and impersonating any service
+account in the namespace.
+
+The deploy projects set `HELM_DRIVER=configmap`, so Helm stores release
+history in ConfigMaps instead of Secrets. That is why the deployer needs no
+access to Secrets at all. This includes the application credentials that a
+later secrets integration will place in the namespace.
+
+Trade-offs of this tighter option:
+
+- **New kinds need an RBAC change.** Each kind the chart adds needs a
+  cluster-administrator change: HPA, PDB, Ingress, CronJob, the migration Job
+  (with `pods/log` read), and custom resources such as `ExternalSecret`. The
+  chart tests fail until the role covers every rendered kind, so the gap shows
+  up in a pull request, not in a failed deployment.
+- **Release history is readable.** Anyone who can read ConfigMaps in the
+  namespace can read Helm's release history. This is acceptable because values
+  and manifests never contain credentials.
+- **The driver is hard to change later.** Changing Helm's storage driver later
+  means migrating release history, so choose it before the first install.
 
 ## 3. Networking for a private EKS API endpoint
 
@@ -241,9 +274,9 @@ known-vulnerable dependencies installed in the image.
    - Rollback cannot target the source stage, or an execution that was itself
      a rollback.
    - Editing the pipeline invalidates earlier rollback targets.
-2. **Fallback:** if the pipeline is unavailable, run `helm rollback mobile-api
-   <revision> --namespace <ns> --wait` from the production deploy project, and
-   record it manually.
+2. **Fallback:** if the pipeline is unavailable, run `HELM_DRIVER=configmap helm
+   rollback mobile-api <revision> --namespace mobile-api-production --wait` from
+   the production deploy project, and record it manually.
 
 Afterwards, run the production verification again: the rollout completes,
 running pods use D(n-1), the smoke test passes, and the alarms clear.
@@ -265,6 +298,8 @@ unpredictable.
 - The deploy project runs a single Kubernetes Job with the same digest D and
   the migration command, before `helm upgrade`. The Job has `backoffLimit: 0`
   and a deadline. If it fails, the release stops before any API pod changes.
+  Adding this step means granting the deployer role `jobs` and read access to
+  `pods/log`.
 - Schema changes are backward compatible (expand, then contract):
   - A release may only add: new tables, nullable columns, and indexes built
     concurrently.
@@ -383,5 +418,6 @@ data point counts as breaching; missing 5xx data does not.
 | --- | --- |
 | Chart, environment values, demo application | Implemented. Chart linted, rendered, and schema-validated. Demo run natively. Not installed on a cluster. |
 | Chart tests, smoke test, secret scan, validation buildspec | Implemented and run locally. The buildspec has not run in CodeBuild. |
+| Deployer RBAC (`platform/deploy-rbac.yaml`) | Written, schema-validated, and checked against the rendered chart. Not applied to any cluster. |
 | Container image | Built and run locally with Podman under the chart's restrictions. Not pushed to any registry. |
 | Everything else in this document | Proposed only |
