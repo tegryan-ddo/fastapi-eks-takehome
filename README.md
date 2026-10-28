@@ -10,8 +10,7 @@ of that overnight.
 
 | Area | Status |
 | --- | --- |
-| Smoke-test app | Done; run natively on Python 3.14.2 with the pinned dependencies and the Dockerfile's Uvicorn command |
-| Container image | Dockerfile written; **image not yet built or run** (no container runtime was available) |
+| Smoke-test app and container image | Done; image built and run with Podman 5.7.1 under the chart's restrictions, and the smoke test passes |
 | Chart: Deployment, ClusterIP Service, ServiceAccount | Done, linted, rendered, and schema-validated; **not yet installed on a cluster** |
 | Staging and production values | Minimal (replica counts only) |
 | Verification: chart tests, smoke test, secret scan, validation buildspec | Done and run locally; buildspec not yet run in CodeBuild |
@@ -81,6 +80,9 @@ docker run -d --rm --name demo-api -p 8000:8000 \
   --cap-drop ALL --security-opt no-new-privileges \
   demo-api:0.1.0
 ```
+
+In Git Bash on Windows, run `export MSYS_NO_PATHCONV=1` first. Otherwise
+Git Bash rewrites `/tmp` into a Windows path and the container does not start.
 
 Call the endpoints:
 

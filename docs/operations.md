@@ -200,7 +200,7 @@ ignores entries that are expired or missing an owner or expiry, so those
 findings block again.
 
 **Support:** Inspector ECR scanning supports Debian 13, the base of
-`python:3.14-slim`, and lists Python as a supported language. That it detects
+`python:3.13-slim`, and lists Python as a supported language. That it detects
 the pip-installed packages in this image is not yet confirmed. Check the first
 scan's inventory for `fastapi` and `uvicorn`.
 
@@ -208,14 +208,17 @@ scan's inventory for `fastapi` and `uvicorn`.
 
 Connect the GitHub repository through Inspector Code Security's GitHub
 integration, for SAST, dependency (SCA), and IaC scanning on pull requests and
-on a schedule. **Support check:** AWS documents SAST and SCA for "Python 3.13 or
-earlier". This service targets Python 3.14, and the documentation does not
-name the Python dependency-manifest formats it reads, so `requirements.txt` is
+on a schedule.
+
+**Support check:** AWS documents SAST and SCA for "Python 3.13 or earlier". The
+service therefore targets Python 3.13 rather than 3.14 (see
+[decisions.md](decisions.md)). The documentation does not name the Python
+dependency-manifest formats SCA reads, so coverage of `requirements.txt` is
 unconfirmed.
 
-Until a trial scan shows Python findings for this repository, Code Security
-results are advisory. The image gate still covers known-vulnerable dependencies
-installed in the image. The alternative is to target Python 3.13.
+Until a trial scan shows dependency findings for this repository, treat Code
+Security's SCA results as advisory. The image gate still covers
+known-vulnerable dependencies installed in the image.
 
 ## 5. Rollback and migrations
 
@@ -371,8 +374,8 @@ data point counts as breaching; missing 5xx data does not.
   - EKS endpoint access: private or public;
   - whether NAT is available;
   - whether the cluster's authentication mode supports access entries.
-- **Python version.** 3.14 against Inspector Code Security's documented 3.13
-  support.
+- **Dependency scanning.** Whether Inspector Code Security reads
+  `requirements.txt`.
 
 ## 8. Implemented versus proposed
 
@@ -380,5 +383,5 @@ data point counts as breaching; missing 5xx data does not.
 | --- | --- |
 | Chart, environment values, demo application | Implemented. Chart linted, rendered, and schema-validated. Demo run natively. Not installed on a cluster. |
 | Chart tests, smoke test, secret scan, validation buildspec | Implemented and run locally. The buildspec has not run in CodeBuild. |
-| Container image | Dockerfile written. Not yet built. |
+| Container image | Built and run locally with Podman under the chart's restrictions. Not pushed to any registry. |
 | Everything else in this document | Proposed only |

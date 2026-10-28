@@ -81,8 +81,12 @@ then can these values and the replica counts be set.
 
 ### Container security
 
-- Base image `python:3.14-slim`. Dependencies are pinned, including transitive
-  ones, so rebuilds are reproducible.
+- Base image `python:3.13-slim`, not 3.14. Amazon Inspector Code Security,
+  the proposed source scanner, documents Python support only up to 3.13
+  (checked October 2026). Python 3.13 receives security fixes until October
+  2029. Move to 3.14 once Inspector lists it.
+- Dependencies are pinned, including transitive ones, so rebuilds are
+  reproducible.
 - The image runs as numeric UID/GID 10001. The chart also sets `runAsUser`,
   `runAsGroup`, and `runAsNonRoot`, so it enforces non-root even if an image
   forgets to.
