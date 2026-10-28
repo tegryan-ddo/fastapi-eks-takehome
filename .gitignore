@@ -1,0 +1,30 @@
+# Credentials and local environment
+.env
+.env.*
+*.pem
+*.key
+kubeconfig
+*.kubeconfig
+.kube/
+.aws/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# Build output, packaged charts, downloaded tools, test reports
+build/
+dist/
+*.tgz
+charts/*/charts/
+.tools/
+reports/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,6 @@
+# Staging overrides for charts/mobile-api/values.yaml.
+# The image tag or digest is supplied at deploy time, not stored here.
+
+# Illustrative starting point, not a capacity figure. Autoscaling replaces
+# this in the next increment.
+replicaCount: 2
