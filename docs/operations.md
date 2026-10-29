@@ -1,15 +1,17 @@
 # Delivery and operations proposal
 
-**Status: mostly proposal.** Provisioned by [infra/](../infra/README.md) (CDK):
-the ECR repository, the CodeConnections connection, the validate and build
-CodeBuild projects, the staging VPC with its RDS PostgreSQL instance, and the
-two VPC-connected runner projects (db-admin and integration). In progress, and
-subject to change: an EKS Auto Mode cluster `mobile-api-staging` in the same
-VPC, a `mobile-api-deploy-staging` project that runs Helm, and a
-`mobile-api-secrets-sync` project that writes the Kubernetes Secret from
-Secrets Manager. Nothing else in this document exists: no CodePipeline,
-production deploy project, VPC endpoint, dashboard, or alarm. The table at the
-end separates implemented, provisioned, and proposed.
+**Submission snapshot: `73de0a8`.** GitHub commit statuses report successful
+validation and release builds, and a failed database-bootstrap build. RDS
+integration and an application rollout on EKS are not verified. See the
+[submission status](../README.md) for build references and current limitations.
+
+The [infra/](../infra/README.md) CDK code implements ECR, CodeConnections,
+validation and build projects, the staging VPC and RDS instance, database
+runners, and an EKS Auto Mode cluster with staging deploy and secrets-sync
+projects. A committed stack or buildspec does not establish successful live
+deployment. CodePipeline, production deployment, VPC endpoints, dashboards,
+and alarms remain proposed; the table at the end separates implementation
+from execution evidence.
 
 GitHub hosts the source code and is how the repository is shared. Everything
 that builds, checks, or deploys runs in AWS. No GitHub Actions workflows and
@@ -104,10 +106,10 @@ Required for the real application, specified in
 - an unhealthy replacement that never becomes ready;
 - a database outage: readiness fails, liveness holds, recovery is automatic.
 
-Only the smoke test and `tests/integration` exist as code today. The rollout
-and batch commands are proposed, and none has run against a cluster. The
-integration tests run against RDS from the `mobile-api-integration` runner
-(section 3), not from a cluster.
+The smoke test, `tests/integration`, and the staging deployment buildspec's
+rollout, HTTP, database, and manual batch checks are implemented. Their
+successful execution against RDS and a cluster is not verified in this
+snapshot. The dedicated integration runner tests RDS separately (section 3).
 
 ### Why QUEUED execution, and why stages are grouped this way
 
@@ -138,6 +140,10 @@ no deploy permissions.
 CodeBuild obtains temporary credentials for its service role automatically. No
 long-lived access keys exist, and none are stored in GitHub.
 
+The following table describes the proposed release pipeline's permissions.
+The committed demo roles and its public-endpoint staging setup are documented
+in [infra/README.md](../infra/README.md).
+
 | Role | Used by | Allows | Does not allow |
 | --- | --- | --- | --- |
 | Build | build-and-validate, image gate, package | ECR push and read on the `mobile-api` repository only (plus `ecr:GetAuthorizationToken`); `ecr:DescribeImageScanFindings`; read and write on the pipeline artifact bucket and its KMS key; its own CloudWatch log group; CodeBuild reports | Any `eks:*` action. It has no EKS access entry, so it cannot authenticate to any cluster. |
@@ -147,10 +153,11 @@ long-lived access keys exist, and none are stored in GitHub.
 | DB admin (`mobile-api-db-admin`) | one-off creation of the application role in RDS | Read `/mobile-api/staging/rds-master` and the `DATABASE_URL` key of `/mobile-api/staging/runtime`; VPC network interfaces; its log group | ECR, EKS, S3 |
 | Integration (`mobile-api-integration`) | `python -m app.migrate` and `tests/integration` against RDS | Read `DATABASE_URL` from `/mobile-api/staging/runtime`; VPC network interfaces; its log group and report group | The master secret; ECR push; EKS |
 
-The build, validation, db-admin, and integration roles are provisioned by
-[infra/](../infra/README.md) (CDK). The two deploy roles are proposed.
+The CDK code defines build, validation, db-admin, integration, staging deploy,
+and secrets-sync roles. The production deploy role remains proposed.
 
-Each role trusts `codebuild.amazonaws.com` with an `aws:SourceArn` condition
+In the proposed release pipeline, each role trusts `codebuild.amazonaws.com`
+with an `aws:SourceArn` condition
 naming its own project. The staging project therefore cannot use the
 production role. The CodePipeline service role may start these projects, use
 the CodeConnections connection, read and write artifacts, and publish approval
@@ -257,7 +264,8 @@ workload. These are separate steps with separate owners.
    - **If the integration differs** (for example the Secrets Store CSI driver),
      only `runtimeSecret.name` and the restart behaviour below change.
    - **This exercise's stand-in:** the `mobile-api-secrets-sync` CodeBuild
-     project (infra/, in progress) reads `/mobile-api/staging/runtime` and
+     project (implemented in infra/; successful sync unverified here) reads
+     `/mobile-api/staging/runtime` and
      writes Secret `mobile-api-runtime` in the staging namespace. It does not
      refresh on its own; run it again after the secret changes.
 4. **Consume, through the chart.**
@@ -327,14 +335,16 @@ Elastic IP.
 
 ### RDS environment
 
-Provisioned by [infra/](../infra/README.md) (CDK) to reproduce the external
-database for this exercise. Database tuning is out of scope.
+Defined by [infra/](../infra/README.md) (CDK) to reproduce the external
+database for this exercise. The database-bootstrap build failed at this
+snapshot; successful RDS integration remains unverified. Database tuning is
+out of scope.
 
 | Item | Setting |
 | --- | --- |
 | Network | VPC `mobile-api`, private subnets, one NAT gateway for the runners' outbound access (PyPI, GitHub, ECR, Secrets Manager) |
 | Instance | RDS for PostgreSQL 17 `mobile-api-staging`, `db.t4g.micro`, storage encrypted, not publicly accessible, database `mobileapi` |
-| Inbound | TCP 5432 only from the integration-runner security group and from the workloads of the EKS Auto Mode cluster `mobile-api-staging` being provisioned in the same VPC. Nothing else, including the build project, can reach it. |
+| Inbound | TCP 5432 only from the integration-runner security group and from the workloads of the EKS Auto Mode cluster `mobile-api-staging` defined in the same VPC. Nothing else, including the build project, can reach it. |
 | TLS | Server certificate from RDS CA `rds-ca-rsa2048-g1`. Clients use `sslmode=verify-full`, verifying certificate and hostname against the RDS global bundle baked into the image. |
 | Master user | `postgres_admin`; credentials generated by RDS into Secrets Manager `/mobile-api/staging/rds-master`. Used only by the one-off `mobile-api-db-admin` runner, never by the application, the pipeline, or in this conversation. |
 | Application role | `mobile_api_app`, created by `platform/db/create_app_user.sql` with the password the operator loaded into `/mobile-api/staging/runtime`. Owns the application's schema objects and has `CREATE` on schema `public`, so migrations run as this role. |
@@ -343,8 +353,8 @@ How things reach it:
 
 - **Application pods** connect from the EKS cluster over the VPC: the cluster
   shares this VPC, the endpoint's private DNS name resolves from it, and the
-  pods' security group is the one allowed in. The cluster is still being
-  provisioned, so this path is untested.
+  pods' security group is the one allowed in. This path is defined in CDK;
+  successful application connectivity is not verified in this snapshot.
 - **Integration runner** (`mobile-api-integration`) runs in the private subnets
   with the allowed security group. CodeBuild injects `DATABASE_URL` from
   Secrets Manager at build start; the runner applies the migrations, then runs
@@ -485,7 +495,9 @@ unpredictable.
 
 ## 6. Monitoring
 
-Everything here is proposed. Nothing is configured yet.
+Application monitoring, dashboards, and alarms remain proposed. CodeBuild
+logs and reports are part of the implemented build path; the snapshot does
+not establish a working application monitoring setup.
 
 **Logs.** CodeBuild writes build and deploy logs to one CloudWatch Logs group
 per project. CodePipeline execution events go through EventBridge to SNS for
@@ -597,12 +609,13 @@ data point counts as breaching; missing 5xx data does not.
 
 | Item | State |
 | --- | --- |
-| Chart (API, HPA, PDB, CronJob, migration hook Job, Ingress off by default, secret references) and environment values | Implemented. Linted, rendered, schema-validated, and relationship-checked. Not installed on a cluster. |
-| EKS Auto Mode cluster `mobile-api-staging`, `mobile-api-deploy-staging`, `mobile-api-secrets-sync` | Being provisioned by infra/ (CDK); in progress. Nothing deployed to it yet. |
+| Chart (API, HPA, PDB, CronJob, migration hook Job, Ingress off by default, secret references) and environment values | Implemented. Linted, rendered, schema-validated, and relationship-checked. Cluster rollout unverified. |
+| EKS Auto Mode cluster `mobile-api-staging`, `mobile-api-deploy-staging`, `mobile-api-secrets-sync` | Implemented in CDK and buildspecs. Successful live application deployment and secret sync unverified. |
 | Demo application (PostgreSQL persistence, migration, batch replay) and container image | Implemented. Unit-tested, built, and checked locally with Podman against a PostgreSQL 17 container. |
 | Chart, app, integration, and secrets-loader tests; container check; smoke test; secret scan; buildspecs | Implemented and run locally. |
-| ECR repository, CodeConnections connection, CodeBuild validate and build projects | Provisioned by infra/ (CDK). |
-| Staging VPC, RDS PostgreSQL 17 instance, db-admin and integration runners | Provisioned by infra/ (CDK). Integration tests against RDS pending the operator steps. |
+| ECR repository, CodeConnections connection, CodeBuild validate and build projects | Implemented in CDK. GitHub reports successful validation and release builds for `73de0a8`; see the root README for references. |
+| Staging VPC, RDS PostgreSQL 17 instance, db-admin and integration runners | Implemented in CDK. GitHub reports database-bootstrap failure for `73de0a8`; RDS integration unverified. |
 | Secrets loader (`scripts/load_secrets.py`) | Implemented. Offline tests only. Never run against AWS by the agent. |
-| Deployer RBAC (`platform/deploy-rbac.yaml`) | Written, schema-validated, and checked against the rendered chart. Not applied to any cluster. |
+| Deployer RBAC (`platform/deploy-rbac.yaml`) | Written, schema-validated, and checked against the rendered chart. Successful use on a live cluster unverified. |
 | Everything else in this document | Proposed only |
+

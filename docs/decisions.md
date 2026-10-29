@@ -4,6 +4,12 @@ Covers the demo application, its container image, the Helm chart, and the
 database the demo uses. Delivery, secrets handling, RDS networking, and
 monitoring are designed in [operations.md](operations.md).
 
+**Submission snapshot:** implementation at
+`73de0a81352ed9bca79f8d4c9e0ad5d080481fce`. See the [README](../README.md)
+and [verification record](verification.md) for the reported build results and
+remaining checks. EKS infrastructure code is included; a successful live
+application deployment, RDS integration, and ALB routing are not verified.
+
 ## Assumptions
 
 ### Application
@@ -33,16 +39,18 @@ monitoring are designed in [operations.md](operations.md).
 
 ### Database
 
-- PostgreSQL is a real Amazon RDS for PostgreSQL 17 instance, provisioned by
-  [infra/](../infra/README.md) for this exercise only, to reproduce the
-  external database dependency. The employer's database is managed elsewhere;
-  provisioning and tuning are out of scope.
-- It is reachable privately only. Port 5432 is open to the workloads of the
-  EKS Auto Mode cluster being provisioned in the same VPC and to the
-  integration runner.
-- The application connects as a dedicated role, `mobile_api_app`, never as the
-  master user. The master credentials exist only in Secrets Manager and are
-  used once, by the db-admin runner, to create the role.
+- The exercise infrastructure defines Amazon RDS for PostgreSQL 17 in
+  [infra/](../infra/README.md) to reproduce the external database dependency.
+  The employer's database is managed elsewhere; its provisioning and tuning
+  are out of scope. Application connectivity to the exercise database remains
+  unverified in this snapshot.
+- The intended network path is private, with port 5432 restricted to the EKS
+  workloads in the same VPC and the integration runner. Live connectivity has
+  not been demonstrated by the available results.
+- The application is configured to use the dedicated role `mobile_api_app`,
+  never the master user. The db-admin runner obtains the master credentials
+  from Secrets Manager to create the role. Its latest reported build failed,
+  so successful role creation and permissions are not confirmed here.
 - Connections use TLS with certificate and hostname verification against the
   RDS certificate bundle.
 
@@ -51,8 +59,9 @@ monitoring are designed in [operations.md](operations.md).
 - The employer's EKS cluster exists and runs Kubernetes 1.30 or later.
   `Chart.yaml` enforces this through `kubeVersion`, because the chart uses the
   native `preStop` sleep action. For this exercise, [infra/](../infra/README.md)
-  is provisioning an EKS Auto Mode cluster, `mobile-api-staging`, in the RDS
-  VPC (in progress).
+  defines an EKS Auto Mode cluster, `mobile-api-staging`, in the RDS VPC.
+  Infrastructure implementation is included; live cluster readiness and an
+  application install have not been verified for this submission.
 - metrics-server (the resource metrics API) is installed. Without it, the HPA
   cannot read CPU utilization and does not scale.
 - A cluster secrets integration already exists. It creates the namespaced
@@ -96,7 +105,7 @@ monitoring are designed in [operations.md](operations.md).
 | Setting | Value | Reason |
 | --- | --- | --- |
 | Driver | asyncpg, bounded pool | Async, so database waits never block the single-worker event loop. Parameterized queries only. |
-| Pool size | `DATABASE_POOL_MIN=0`, `DATABASE_POOL_MAX=5` | Nothing is held while idle; at most 5 connections per pod. The connection budget is `maxReplicas × 5` plus runners and batch. |
+| Pool size | `DATABASE_POOL_MIN=0`, `DATABASE_POOL_MAX=5` | Starts without pre-opening connections; reuses up to 5 per single-worker pod. Budget active, surge, and terminating pods, plus runners, batch, and other clients. |
 | Connect timeout | `DATABASE_CONNECT_TIMEOUT=3` s | A dead host fails fast instead of holding a request. |
 | Pool acquisition timeout | `DATABASE_ACQUIRE_TIMEOUT=2` s | Saturation surfaces as an error, not an unbounded queue. |
 | Query timeout | `DATABASE_QUERY_TIMEOUT=5` s | No request waits longer than the client would. |
@@ -119,18 +128,24 @@ Readiness includes the database; liveness does not.
   liveness still passes, so the process stays up with its health endpoints
   exposed, and readiness returns automatically when connectivity does.
 - The check is a pooled `SELECT 1` with a 1.5s budget, under the probe's 2s
-  timeout. It reuses the pool; probes never open fresh connections.
-- A database-wide outage therefore takes every pod out of rotation. An ALB
-  fails open: with no healthy target it routes to all of them anyway, so
-  clients receive the application's own 503s rather than a load-balancer
-  error. That is accepted for the demo, which can do nothing useful without
-  the database. There is no special replica that always reports ready.
+  timeout. It reuses available pooled connections; first use or recovery can
+  require the pool to open a connection.
+- A database-wide outage therefore makes every pod unready. An ALB can fail
+  open when its registered targets are all unhealthy; if targets are removed
+  or unused, it can instead return its own 503. The exact outcome depends on
+  target registration and controller behavior and needs a live test. The
+  application must handle database failure safely even while unready. The
+  demo can do nothing useful without the database; no replica always reports
+  ready.
 - If the real service can do useful work without PostgreSQL (cached reads, a
   degraded mode, a maintenance response), its readiness should **not** include
-  the database check, so those pods stay in rotation. A static maintenance
-  page in S3 as the lowest-priority ALB rule is a further option for later.
-- During a deploy, the same outage makes `helm upgrade --wait` time out and
-  roll back, because no new pod becomes ready. That is the desired outcome.
+  the database check, so those pods stay in rotation. A separate maintenance
+  response would need an explicit routing design.
+- During a deploy, the same outage can make `helm upgrade --wait` time out
+  because no new pod becomes ready. `--wait` alone does not roll back:
+  automatic rollback requires the documented Helm 4
+  `--rollback-on-failure` option. A release rollback does not undo database
+  migrations.
 
 ### Schema migrations
 
@@ -165,8 +180,9 @@ single Uvicorn process.
   reaches only whichever worker accepts it.
 - A crash or OOM kill affects one small pod, not several workers at once.
 - Cost: more pods, each with its own baseline memory and its own connection
-  pool. At peak, `maxReplicas × DATABASE_POOL_MAX` must stay within Postgres's
-  connection budget. This may require a pooler such as RDS Proxy or PgBouncer.
+  pool. The connection budget must include maximum API replicas, surge and
+  terminating pods, batch, migrations, and other clients. A pooler such as RDS
+  Proxy or PgBouncer is a possible follow-up after measuring that budget.
 
 ### Health probes
 
@@ -302,8 +318,9 @@ this sleep need to be tuned together.
 - The host, certificate ARN, and ALB annotations differ per environment and
   are supplied at deploy time through an extra values file. The example in
   `environments/staging.yaml` uses `target-type: ip`, so the ALB sends traffic
-  to pods directly; the preStop sleep then covers target deregistration. The
-  HTTP listener exists only to redirect to HTTPS.
+  to pods directly; the preStop sleep allows time for routing changes but
+  does not guarantee target deregistration has completed. The HTTP listener
+  exists only to redirect to HTTPS.
 - The payment-provider webhook route will share this ALB; signature
   verification belongs in the application.
 - Untested on a cluster. The ALB's deregistration delay and the preStop sleep
@@ -312,8 +329,9 @@ this sleep need to be tuned together.
 ### Rollout, selectors, image reference
 
 - Rolling update with `maxUnavailable: 0` and `maxSurge: 25%`. Replacement pods
-  must pass readiness before old ones stop, so ready capacity never drops
-  during a deploy. This needs spare cluster capacity for the surge pods.
+  must pass readiness before the controller removes old ones. This limits
+  rollout-driven capacity loss, but does not prevent concurrent failures and
+  needs spare cluster capacity for surge pods.
 - Selectors use `app.kubernetes.io/name`, `instance`, and `component`. They
   contain no version, because Deployment selectors are immutable. Batch and
   migration pods carry their own `component` value and match no API selector.
@@ -327,12 +345,15 @@ this sleep need to be tuned together.
 - **Ingress on a cluster**: the template exists but has not been exercised;
   the host, certificate, and deregistration tuning come with the first deploy.
 - **Topology placement**: topology spread across Availability Zones and nodes.
-- **Production database**: only the staging instance exists. The production
-  connection budget, pooler decision, and the EKS workload security-group
-  rule depend on the cluster and the real service.
+- **Production database**: the exercise infrastructure targets staging. The
+  production connection budget, pooler decision, and EKS workload networking
+  depend on the cluster and the real service. RDS integration remains
+  unverified in this snapshot.
 - **Delivery and monitoring**: designed in [operations.md](operations.md).
-  The build path and the staging database are provisioned; the pipeline,
-  deploy projects, and alarms are not.
+  Build and EKS infrastructure definitions are included, and the reported
+  validation and release builds succeeded. This does not establish a passing
+  live deployment, production promotion, or working alarms; see
+  [verification.md](verification.md).
 
 Also not addressed yet: pinning the base image by digest, NetworkPolicy, and
 multi-arch builds.

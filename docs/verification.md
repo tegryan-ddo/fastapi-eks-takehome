@@ -3,15 +3,33 @@
 What can be checked today, what each check is meant to catch, and the checks
 that still need RDS, a cluster, or the real application.
 
+## Submission snapshot
+
+Source: `73de0a81352ed9bca79f8d4c9e0ad5d080481fce`. The reported AWS build
+statuses for this source are:
+
+| Build | Reported status | Build ID |
+| --- | --- | --- |
+| Validation | Succeeded | `9c03ab36-c706-48c9-b3fe-984c73efdd04` |
+| Release build | Succeeded | `9c8d8f4c-73e8-473f-a97b-c7e58d52cb69` |
+| Database administration | Failed | `3ce3d688-ea37-4da0-a4ed-f3be7e9d9eff` |
+
+Raw build logs were not available for this snapshot, so these are overall
+build statuses, not independently reviewed per-test results. The db-admin
+failure has not been diagnosed here. No successful RDS integration or live
+EKS application deployment is established by these results. A successful
+release build is not a successful deployment. See the [README](../README.md)
+for the submission scope.
+
 There are five levels of evidence. Keep them apart:
 
 | Level | Status |
 | --- | --- |
-| Unit tests (demo app, secrets loader) | Run locally |
-| Rendered manifests (lint, schema, relationships) | Run locally |
-| Local container (image built and run with Docker or Podman; a PostgreSQL 17 container stands in for RDS) | Run locally |
-| RDS (the real database, through the VPC-connected `mobile-api-integration` runner) | **Not yet run.** Pending the operator steps in the README. |
-| Kubernetes cluster (install, migration hook, rollout, CronJob, HPA, Ingress) | **Not run.** An EKS Auto Mode cluster is being provisioned by infra/; nothing has run on it yet. |
+| Unit tests (demo app, secrets loader) | Previously documented as run locally; not rerun for this snapshot. Overall AWS validation/build statuses are above. |
+| Rendered manifests (lint, schema, relationships) | Previously documented as run locally; not rerun for this snapshot. |
+| Local container (image built and run with Docker or Podman; a PostgreSQL 17 container stands in for RDS) | Previously documented as run locally; not rerun for this snapshot. |
+| RDS (the real database, through the VPC-connected `mobile-api-integration` runner) | **Unverified.** The latest reported db-admin build failed; no passing RDS integration result is recorded. |
+| Kubernetes cluster (install, migration hook, rollout, CronJob, HPA, Ingress) | **Unverified.** EKS Auto Mode infrastructure code is included; no passing live application deployment or acceptance result is recorded. |
 
 A local HTTP response does not show that ALB routing, DNS, TLS, or rollout
 behaviour work. A passing check against the PostgreSQL container does not show
@@ -46,8 +64,9 @@ Kubernetes JSON schemas from GitHub when it runs.
 `buildspecs/validate.yml` runs `pytest` and the secret scan in CodeBuild on
 pull requests; without a database, the integration tests do not run there.
 `buildspecs/build.yml` runs those plus the container check, then pushes the
-image. Both projects are provisioned by infra/ (CDK). No AWS build result is
-recorded in this document.
+image. Both projects are defined by infra/ (CDK). Overall AWS build statuses
+are recorded above; their raw logs and individual test results were not
+reviewed while preparing this snapshot.
 
 ### Relationship checks (`tests/chart/test_chart.py`)
 
@@ -104,8 +123,11 @@ broken copy of the chart.
 
 ## Checks against RDS
 
-None has run. All of them wait for the operator steps in the README: load the
-secret, start `mobile-api-db-admin` once, then start `mobile-api-integration`.
+No passing RDS checks are recorded in this snapshot. The latest reported
+`mobile-api-db-admin` build failed (ID above), and its raw logs were not
+available here. Diagnose that failure and confirm role creation, then follow
+the existing operator runbook and run `mobile-api-integration`. Do not treat
+successful local PostgreSQL checks as RDS verification.
 
 | Check | How | Status |
 | --- | --- | --- |
@@ -118,9 +140,9 @@ secret, start `mobile-api-db-admin` once, then start `mobile-api-integration`.
 
 ## Manual staging batch run
 
-The CronJob `mobile-api-batch` is deployed in staging with `suspend: true`, so
-nothing runs on a schedule. Before promotion, run one Job from its current
-template:
+The chart configures the staging CronJob `mobile-api-batch` with
+`suspend: true`, so it will not run on a schedule. Once installed in staging,
+run one Job from its current template before promotion:
 
 ```sh
 NS=mobile-api-staging
@@ -184,10 +206,10 @@ pipeline's verify-staging step can run these commands.
 
 ## Staging acceptance plan
 
-None of these has been executed. Scenarios 1, 4, 6, and 7 can run with the demo
-once a cluster exists. Scenarios 2 and 3 need the real application and the
-payment-provider contract. Scenario 5 needs a deliberately slow endpoint, which
-the demo lacks.
+No passing executions of these scenarios are recorded in this snapshot.
+Scenarios 1, 4, 6, and 7 can run with the demo once a cluster is available.
+Scenarios 2 and 3 need the real application and the payment-provider contract.
+Scenario 5 needs a deliberately slow endpoint, which the demo lacks.
 
 | # | Scenario | Action | Assertions | Status |
 | --- | --- | --- | --- | --- |
