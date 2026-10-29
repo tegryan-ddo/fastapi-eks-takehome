@@ -42,15 +42,21 @@ def test_missing_ca_bundle_is_rejected(tmp_path):
         settings(DATABASE_CA_BUNDLE=str(tmp_path / "missing.pem"))
 
 
+@pytest.mark.parametrize("port", ["abc", "99999", "0"])
+def test_invalid_port_is_rejected_at_startup(port):
+    with pytest.raises(ConfigurationError, match="DATABASE_URL"):
+        settings(DATABASE_URL=URL.replace(":5432", f":{port}"))
+
+
 def test_pool_and_timeout_defaults_and_overrides():
     defaults = settings()
-    assert (defaults.pool_min, defaults.pool_max) == (0, 5)
+    assert defaults.pool_max == 5
     assert (defaults.connect_timeout, defaults.acquire_timeout, defaults.query_timeout) == (3, 2, 5)
-    tuned = settings(DATABASE_POOL_MIN="1", DATABASE_POOL_MAX="8", DATABASE_QUERY_TIMEOUT="1.5")
-    assert (tuned.pool_min, tuned.pool_max, tuned.query_timeout) == (1, 8, 1.5)
+    tuned = settings(DATABASE_POOL_MAX="8", DATABASE_QUERY_TIMEOUT="1.5")
+    assert (tuned.pool_max, tuned.query_timeout) == (8, 1.5)
 
 
-@pytest.mark.parametrize("env", [{"DATABASE_POOL_MAX": "many"}, {"DATABASE_POOL_MAX": "0"}, {"DATABASE_POOL_MIN": "6"}, {"DATABASE_CONNECT_TIMEOUT": "-1"}])
+@pytest.mark.parametrize("env", [{"DATABASE_POOL_MAX": "many"}, {"DATABASE_POOL_MAX": "0"}, {"DATABASE_CONNECT_TIMEOUT": "-1"}])
 def test_invalid_tunables_are_rejected(env):
     with pytest.raises(ConfigurationError):
         settings(**env)

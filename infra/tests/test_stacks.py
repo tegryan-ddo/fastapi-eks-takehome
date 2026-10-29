@@ -79,7 +79,7 @@ def test_webhooks_trigger_validation_on_pull_requests_and_build_on_main(template
                        for f in group if f["Type"] == "EVENT"}
     assert validate_events == {"PULL_REQUEST_CREATED, PULL_REQUEST_UPDATED, PULL_REQUEST_REOPENED"}
     (build_group,) = build["mobile-api-build"]["Triggers"]["FilterGroups"]
-    assert {(f["Type"], f["Pattern"]) for f in build_group} == {("EVENT", "PUSH"), ("HEAD_REF", "refs/heads/main")}
+    assert {(f["Type"], f["Pattern"]) for f in build_group} == {("EVENT", "PUSH"), ("HEAD_REF", "^refs/heads/main$")}
     for project in projects(templates["integration"]).values():
         assert not project.get("Triggers", {}).get("Webhook"), "VPC runners are started by hand"
 

@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "mobile-api.fullname" . }}-migrate
+  name: {{ include "mobile-api.migrateName" . }}
   labels:
     {{- include "mobile-api.labels" . | nindent 4 }}
     app.kubernetes.io/component: migrate

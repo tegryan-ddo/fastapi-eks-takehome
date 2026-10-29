@@ -36,10 +36,10 @@ dependency; it does not run PostgreSQL inside Kubernetes.
 | Area | Status |
 | --- | --- |
 | Demo application: HTTP API with PostgreSQL persistence, migration command, batch command | Done; unit-tested, and checked locally against a PostgreSQL 17 container |
-| Container image | Built and checked locally with Podman under the chart's restrictions |
+| Container image | Built, checked, and pushed to ECR by the `mobile-api-build` CodeBuild project (tag = commit SHA); also checked locally with Podman |
 | Chart: Deployment, Service, ServiceAccount, HPA, PDB, CronJob, migration hook Job, secret references | Linted, rendered, schema-validated, and relationship-checked; **not installed on a cluster** |
 | Staging database: VPC, RDS PostgreSQL 17, VPC-connected db-admin and integration runners | Provisioned by [infra/](infra/README.md) (CDK); **integration tests against RDS pending the operator steps below** |
-| Build path: ECR repository, CodeConnections, CodeBuild validate and build projects | Provisioned by [infra/](infra/README.md) (CDK) |
+| Build path: ECR repository, CodeConnections, CodeBuild validate and build projects | Provisioned by [infra/](infra/README.md) (CDK). `mobile-api-validate` runs on pull requests through the GitHub App webhook; `mobile-api-build` has pushed an image |
 | Staging cluster: EKS Auto Mode `mobile-api-staging` in the RDS VPC, `mobile-api-deploy-staging` (runs Helm), `mobile-api-secrets-sync` (writes the Kubernetes Secret `mobile-api-runtime` from Secrets Manager) | Being provisioned by [infra/](infra/README.md) (CDK); in progress, nothing deployed to it yet |
 | Ingress (ALB) | In the chart, off by default; the host and ACM certificate are supplied at deploy time; **not tested on a cluster** |
 | Secrets loader (`scripts/load_secrets.py`) | Included; offline tests pass with dummy values and mocked AWS clients |
@@ -92,15 +92,17 @@ starts without the database and reports not ready until it can reach it. TLS
 is verified against the RDS global certificate bundle baked into the image;
 `sslmode=disable` is for local throwaway databases only.
 
-The image runs one Uvicorn worker on `0.0.0.0:8000` as UID 10001. Logs are JSON
-lines on stdout (errors on stderr) and never contain credentials, the database
-URL, environment dumps, or request bodies.
+The image runs one Uvicorn worker on `0.0.0.0:8000` as UID 10001. Application
+events are JSON lines on stdout (errors on stderr) and never contain
+credentials, the database URL, environment dumps, or request bodies. Uvicorn's
+own startup and access lines are plain text.
 
 ## Prerequisites
 
 - Docker 24 or later, or Podman. Replace `docker` with `podman` if needed.
 - Python 3.12 or later for the verification commands.
-- Helm 3.x or 4.x for the manual chart commands. The verification commands
+- Helm 4.x (verified with 4.3.1). Lint and template also work with Helm 3.x,
+  but the deploy command below uses Helm 4 flags. The verification commands
   download their own pinned Helm.
 - `curl`, and a POSIX shell (bash, zsh, or Git Bash on Windows). Run commands
   from the repository root. In Git Bash, run `export MSYS_NO_PATHCONV=1` first,
@@ -115,25 +117,30 @@ and holds no real data, which is why `sslmode=disable` is acceptable here.
 docker network create demo
 docker run -d --rm --name demo-postgres --network demo \
   -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_USER=demo -e POSTGRES_DB=mobileapi \
-  postgres:17-alpine
+  public.ecr.aws/docker/library/postgres:17.11-alpine
 
 docker build --build-arg APP_VERSION=0.1.0 -t demo-api:0.1.0 examples/demo-api
 
 # Same restrictions as the chart: read-only root filesystem, writable /tmp,
 # no Linux capabilities, no privilege escalation (the image runs as UID 10001)
-RUN="docker run --rm --network demo --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
-  -e DATABASE_URL=postgresql://demo@demo-postgres:5432/mobileapi?sslmode=disable"
+run() {
+  docker run --rm --network demo --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
+    -e DATABASE_URL=postgresql://demo@demo-postgres:5432/mobileapi?sslmode=disable "$@"
+}
 
-$RUN demo-api:0.1.0 python -m app.migrate                       # apply the schema first
-$RUN -d --name demo-api -p 8000:8000 demo-api:0.1.0             # then the API
+# PostgreSQL takes a few seconds to accept connections on first start
+for i in $(seq 1 30); do docker exec demo-postgres pg_isready -U demo -q && break; sleep 1; done
+
+run demo-api:0.1.0 python -m app.migrate                        # apply the schema first
+run -d --name demo-api -p 8000:8000 demo-api:0.1.0              # then the API
 
 curl -i http://localhost:8000/health/ready
 curl -i -X POST http://localhost:8000/demo/records -H 'content-type: application/json' -d '{"note":"hello"}'
 curl -i http://localhost:8000/demo/records/1
 python scripts/smoke_test.py http://localhost:8000 --expect-version 0.1.0 --expect-demo
 
-$RUN demo-api:0.1.0 python -m app.batch --business-date 2026-10-27   # run_count 1
-$RUN demo-api:0.1.0 python -m app.batch --business-date 2026-10-27   # same row, run_count 2
+run demo-api:0.1.0 python -m app.batch --business-date 2026-10-27    # run_count 1
+run demo-api:0.1.0 python -m app.batch --business-date 2026-10-27    # same row, run_count 2
 curl -i http://localhost:8000/demo/batch-runs/2026-10-27
 
 docker stop demo-api demo-postgres   # SIGTERM; both are removed because of --rm
@@ -170,8 +177,9 @@ helm template mobile-api charts/mobile-api -f environments/production.yaml \
 ## Set up the staging database and secrets (operator)
 
 The staging RDS instance, its VPC, and two VPC-connected CodeBuild runners are
-created by [infra/](infra/README.md). Nothing in this conversation, in CI, or in
-Git ever holds a database password. The steps, in order:
+created by [infra/](infra/README.md). No database password ever appears in Git
+or in this conversation; the two VPC runners receive credentials from Secrets
+Manager at run time, inside the VPC. The steps, in order:
 
 1. **Load the application secret** from your own trusted terminal. The
    database password is one you choose for the application role; type it only
@@ -224,6 +232,8 @@ HELM_DRIVER=configmap helm upgrade --install mobile-api charts/mobile-api \
   --set image.digest=$DIGEST \
   --rollback-on-failure --wait=watcher --timeout 10m
 ```
+
+Those are Helm 4 flags; with Helm 3 use `--atomic --wait` instead.
 
 To expose the API, enable the Ingress in the same file with your host and the
 ALB annotations shown in `environments/staging.yaml`. TLS terminates at the

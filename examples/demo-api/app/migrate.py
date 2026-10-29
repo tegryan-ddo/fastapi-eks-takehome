@@ -6,6 +6,12 @@ Runs as a controlled release step before the application deploys, never from
 API pods or health endpoints. Repeating it is safe: applied versions are
 recorded in schema_migrations and skipped. Concurrent runs wait on an advisory
 lock, so no two runs apply the same migration.
+
+Each file runs in one transaction with its schema_migrations row. A file whose
+first line is `-- migrate: no-transaction` runs outside one, for the single
+statement PostgreSQL refuses inside a transaction block, such as
+CREATE INDEX CONCURRENTLY; its row is written only after the statement
+succeeds, so a failed run is retried by the next.
 """
 
 import asyncio
@@ -19,6 +25,26 @@ MIGRATIONS = Path(__file__).with_name("migrations")
 LOCK_KEY = 20261028  # any constant; every migrate run takes the same session lock
 LOCK_WAIT_SECONDS = 30
 MIGRATION_TIMEOUT_SECONDS = 60
+NO_TRANSACTION_HEADER = "-- migrate: no-transaction"
+
+
+def runs_in_transaction(sql):
+    """False only when the file's first line is the no-transaction header."""
+    first_line = sql.lstrip().split("\n", 1)[0].strip()
+    return first_line != NO_TRANSACTION_HEADER
+
+
+async def apply_one(connection, path):
+    sql = path.read_text()
+    record = ("INSERT INTO schema_migrations (version) VALUES ($1)", path.stem)
+    if runs_in_transaction(sql):
+        # Applied and recorded together, or not at all.
+        async with connection.transaction():
+            await connection.execute(sql, timeout=MIGRATION_TIMEOUT_SECONDS)
+            await connection.execute(*record)
+    else:
+        await connection.execute(sql, timeout=MIGRATION_TIMEOUT_SECONDS)
+        await connection.execute(*record)
 
 
 async def apply_pending(connection):
@@ -34,10 +60,7 @@ async def apply_pending(connection):
         for path in sorted(MIGRATIONS.glob("[0-9][0-9][0-9][0-9]_*.sql")):
             if path.stem in done:
                 continue
-            # One transaction per migration: it is applied and recorded together, or not at all.
-            async with connection.transaction():
-                await connection.execute(path.read_text(), timeout=MIGRATION_TIMEOUT_SECONDS)
-                await connection.execute("INSERT INTO schema_migrations (version) VALUES ($1)", path.stem)
+            await apply_one(connection, path)
             log_event("migration_applied", version=path.stem)
             applied.append(path.stem)
     finally:

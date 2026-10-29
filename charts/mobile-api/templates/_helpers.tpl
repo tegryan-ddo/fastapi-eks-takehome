@@ -15,6 +15,11 @@ already contains the chart name. Truncated to the 63-character DNS limit.
 {{- printf "%s-batch" (include "mobile-api.fullname" .) | trunc 52 | trimSuffix "-" -}}
 {{- end -}}
 
+{{/* Migration hook Job name, truncated after the suffix is added. */}}
+{{- define "mobile-api.migrateName" -}}
+{{- printf "%s-migrate" (include "mobile-api.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
 {{/*
 Labels shared by every selector in this release. Deployment selectors are
 immutable, so nothing that changes between releases (version, chart version)

@@ -1,10 +1,11 @@
 # AWS resources for the take-home
 
 A CDK app (Python) that provisions the AWS side of this exercise in account
-`882384879235`, region `us-east-1`. It covers the build path and the database
-that stands in for the external PostgreSQL dependency. It does **not** create
-an EKS cluster, the release pipeline, ingress, or monitoring; those remain
-proposals in [docs/operations.md](../docs/operations.md).
+`882384879235`, region `us-east-1`. It covers the build path, the database that
+stands in for the external PostgreSQL dependency, and a staging EKS cluster with
+the projects that deploy to it. It does **not** create the release pipeline,
+production, or monitoring; those remain proposals in
+[docs/operations.md](../docs/operations.md).
 
 | Stack | Creates | Why |
 | --- | --- | --- |
@@ -16,8 +17,10 @@ proposals in [docs/operations.md](../docs/operations.md).
 
 Every CodeBuild role is limited to its job: the build role can push to the one
 ECR repository and nothing else; the integration role can read only the
-runtime secret; only the db-admin role can read the master secret; no role has
-any `eks:` permission.
+runtime secret; only the db-admin role can read the master secret; the deploy
+and secrets-sync roles hold `eks:DescribeCluster` on the staging cluster and
+nothing else in EKS, and their Kubernetes permissions come from access entries
+bound to the namespaced RBAC in `platform/`.
 
 ## Deploy
 

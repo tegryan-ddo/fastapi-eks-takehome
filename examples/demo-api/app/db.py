@@ -22,9 +22,11 @@ SSL_MODES = ("verify-full", "disable")
 # refuses the connection, times out, or rejects the statement.
 DATABASE_ERRORS = (OSError, asyncpg.PostgresError, asyncpg.InterfaceError)
 
-# Readiness budget. Together these stay under the probe's 2s timeoutSeconds.
+# Readiness budget, under the probe's 2s timeoutSeconds. The total also bounds
+# the pool's release step, which can wait on the server after a timed-out query.
 READY_ACQUIRE_SECONDS = 1.0
 READY_QUERY_SECONDS = 0.5
+READY_TOTAL_SECONDS = 1.5
 
 CLOSE_TIMEOUT_SECONDS = 5
 
@@ -44,7 +46,6 @@ def error_summary(error):
 class Settings:
     dsn: str
     tls: ssl.SSLContext | bool
-    pool_min: int
     pool_max: int
     connect_timeout: float
     acquire_timeout: float
@@ -55,7 +56,9 @@ class Settings:
         dsn = env.get("DATABASE_URL", "")
         try:
             parts = urlsplit(dsn)
-            valid = parts.scheme in ("postgresql", "postgres") and parts.hostname and len(parts.path) > 1
+            # parts.port raises ValueError for a non-numeric or out-of-range port.
+            valid = (parts.scheme in ("postgresql", "postgres") and parts.hostname
+                     and len(parts.path) > 1 and parts.port != 0)
         except ValueError:
             valid = False
         if not valid:
@@ -66,14 +69,12 @@ class Settings:
         if mode not in SSL_MODES:
             raise ConfigurationError(f"DATABASE_URL sslmode must be one of: {', '.join(SSL_MODES)}")
 
-        pool_min = _number(env, "DATABASE_POOL_MIN", 0, int)
         pool_max = _number(env, "DATABASE_POOL_MAX", 5, int)
-        if pool_max < 1 or pool_min > pool_max:
-            raise ConfigurationError("DATABASE_POOL_MAX must be at least 1 and not below DATABASE_POOL_MIN")
+        if pool_max < 1:
+            raise ConfigurationError("DATABASE_POOL_MAX must be at least 1")
         return cls(
             dsn=dsn,
             tls=_tls_context(env.get("DATABASE_CA_BUNDLE", DEFAULT_CA_BUNDLE)) if mode == "verify-full" else False,
-            pool_min=pool_min,
             pool_max=pool_max,
             connect_timeout=_number(env, "DATABASE_CONNECT_TIMEOUT", 3, float),
             acquire_timeout=_number(env, "DATABASE_ACQUIRE_TIMEOUT", 2, float),
@@ -122,7 +123,7 @@ class Database:
         self.pool = await asyncpg.create_pool(
             settings.dsn,
             ssl=settings.tls,
-            min_size=settings.pool_min,
+            min_size=0,  # not configurable: any minimum would make startup wait for the database
             max_size=settings.pool_max,
             timeout=settings.connect_timeout,
             command_timeout=settings.query_timeout,
@@ -144,9 +145,14 @@ class Database:
     async def check(self):
         """True when a pooled connection answers SELECT 1 within the readiness budget."""
         try:
-            async with self.pool.acquire(timeout=READY_ACQUIRE_SECONDS) as connection:
-                await connection.fetchval("SELECT 1", timeout=READY_QUERY_SECONDS)
-        except DATABASE_ERRORS as error:
+            # asyncpg shields the release from cancellation, so a timeout here
+            # cannot leak the connection.
+            await asyncio.wait_for(self._select_one(), READY_TOTAL_SECONDS)
+        except DATABASE_ERRORS as error:  # TimeoutError is an OSError
             log_event("database_unavailable", level="error", error=error_summary(error))
             return False
         return True
+
+    async def _select_one(self):
+        async with self.pool.acquire(timeout=READY_ACQUIRE_SECONDS) as connection:
+            await connection.fetchval("SELECT 1", timeout=READY_QUERY_SECONDS)

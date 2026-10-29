@@ -445,3 +445,18 @@ def test_deployer_rbac_stays_narrow():
     if len(groups) != len(set(groups)):
         problems.append(f"each environment needs its own group, or one role can deploy to both: {groups}")
     assert not problems, f"{DEPLOYER_RBAC.name}:\n  " + "\n  ".join(problems)
+
+
+def test_names_fit_kubernetes_limits_for_the_longest_release_name():
+    """Helm allows 53-character release names; every resource name must stay within 63."""
+    result = run(
+        tools.path("helm"), "template", "r" * 53, "charts/mobile-api", "-f", "environments/staging.yaml",
+        "--set", "ingress.enabled=true", "--set", "ingress.host=example.test",
+    )
+    assert result.returncode == 0, result.stderr
+    for doc in yaml.safe_load_all(result.stdout):
+        if not doc:
+            continue
+        name, kind = doc["metadata"]["name"], doc["kind"]
+        limit = 52 if kind == "CronJob" else 63  # a CronJob's Jobs get an 11-character suffix
+        assert len(name) <= limit, f"{kind} name {name!r} is {len(name)} characters; limit {limit}"

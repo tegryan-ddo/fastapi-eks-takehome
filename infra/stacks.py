@@ -191,7 +191,8 @@ class BuildStack(cdk.Stack):
             self, "Build", name="mobile-api-build", buildspec="buildspecs/build.yml",
             privileged=True,  # Docker
             timeout_minutes=40,
-            webhook_filters=[codebuild.FilterGroup.in_event_of(codebuild.EventAction.PUSH).and_branch_is("main")],
+            # Anchored: and_branch_is("main") would also match main-hotfix or maintenance.
+            webhook_filters=[codebuild.FilterGroup.in_event_of(codebuild.EventAction.PUSH).and_head_ref_is("^refs/heads/main$")],
             environment_variables={
                 "ECR_REPOSITORY_URI": codebuild.BuildEnvironmentVariable(value=repository.repository_uri),
             },

@@ -2,7 +2,8 @@
 # demo app, and secrets-loader tests) and the secret scan. The container check
 # (scripts/verify_container.py) needs Docker, so it runs in the privileged
 # release build project instead.
-# Proposed CodeBuild configuration; not yet provisioned or run in AWS.
+# Runs in the mobile-api-validate CodeBuild project (infra/, MobileApiBuild
+# stack), triggered by pull-request events through the GitHub App.
 #   Image: aws/codebuild/amazonlinux-x86_64-standard:6.0 (provides Python 3.13)
 #   Source: GitHub through CodeConnections, full clone depth so the secret scan
 #           covers Git history. A shallow or zip source gets a files-only scan.

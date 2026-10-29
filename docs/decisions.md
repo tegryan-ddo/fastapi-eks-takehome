@@ -63,8 +63,9 @@ monitoring are designed in [operations.md](operations.md).
   enabled. EKS Auto Mode provides the controller.
 - Worker nodes are x86-64. Graviton (arm64) nodes would need a multi-arch image
   build.
-- Images live in Amazon ECR, and nodes can pull from it. The repository URL in
-  `values.yaml` is a placeholder.
+- Images live in Amazon ECR, and nodes can pull from it. The repository in
+  `values.yaml` is this exercise's real repository, provisioned by `infra/`;
+  another account overrides it in its own values file.
 - Target namespaces may enforce the Pod Security Standards `restricted`
   profile. All three workloads comply with it.
 
@@ -96,7 +97,7 @@ monitoring are designed in [operations.md](operations.md).
 | Setting | Value | Reason |
 | --- | --- | --- |
 | Driver | asyncpg, bounded pool | Async, so database waits never block the single-worker event loop. Parameterized queries only. |
-| Pool size | `DATABASE_POOL_MIN=0`, `DATABASE_POOL_MAX=5` | Nothing is held while idle; at most 5 connections per pod. The connection budget is `maxReplicas × 5` plus runners and batch. |
+| Pool size | minimum 0 (fixed), `DATABASE_POOL_MAX=5` | Nothing is held while idle, so startup never waits for the database; at most 5 connections per pod. The connection budget is `maxReplicas × 5` plus runners and batch. |
 | Connect timeout | `DATABASE_CONNECT_TIMEOUT=3` s | A dead host fails fast instead of holding a request. |
 | Pool acquisition timeout | `DATABASE_ACQUIRE_TIMEOUT=2` s | Saturation surfaces as an error, not an unbounded queue. |
 | Query timeout | `DATABASE_QUERY_TIMEOUT=5` s | No request waits longer than the client would. |
@@ -147,6 +148,7 @@ a single API or batch pod is touched.
 | Delete policy `before-hook-creation,hook-succeeded` | Successful Jobs disappear; a failed Job stays, with its pod logs, until the next release or `ttlSecondsAfterFinished` (one day). |
 | Namespace default ServiceAccount | A pre-install hook runs before the chart's ServiceAccount exists. No token is mounted, so the account's identity is irrelevant. |
 | Runs as `mobile_api_app` | The application role owns its schema objects and has `CREATE` on schema `public`, granted by `platform/db/create_app_user.sql`. No master credentials reach the cluster. |
+| One transaction per file, with an opt-out | A file is applied and recorded together, or not at all. A file whose first line is `-- migrate: no-transaction` runs its single statement outside a transaction, which `CREATE INDEX CONCURRENTLY` requires; it is recorded only after the statement succeeds, so a failure is retried by the next run. |
 
 Costs: the Secret must exist before the first install; a hook Job is not rolled
 back with the release, so schema changes must stay backward compatible (expand,

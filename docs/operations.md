@@ -140,12 +140,12 @@ long-lived access keys exist, and none are stored in GitHub.
 
 | Role | Used by | Allows | Does not allow |
 | --- | --- | --- | --- |
-| Build | build-and-validate, image gate, package | ECR push and read on the `mobile-api` repository only (plus `ecr:GetAuthorizationToken`); `ecr:DescribeImageScanFindings`; read and write on the pipeline artifact bucket and its KMS key; its own CloudWatch log group; CodeBuild reports | Any `eks:*` action. It has no EKS access entry, so it cannot authenticate to any cluster. |
+| Build | build-and-validate, image gate, package | Granted today (infra/): ECR push, pull and `ecr:DescribeImages` on the `mobile-api` repository only (plus `ecr:GetAuthorizationToken`); its own CloudWatch log group; CodeBuild reports; reading the CodeConnections connection. Proposed with the pipeline: `ecr:DescribeImageScanFindings`, the artifact bucket and its KMS key | Any `eks:*` action. It has no EKS access entry, so it cannot authenticate to any cluster. |
 | Staging deploy | deploy-staging, verify-staging | `eks:DescribeCluster` on the staging cluster; read artifacts and write verification reports in S3; KMS decrypt; its log group; VPC network-interface permissions | ECR push; production cluster or namespace |
 | Production deploy | image re-check, deploy-production, verify-production | The same as staging deploy, but for production, plus `ecr:DescribeImageScanFindings` and `cloudwatch:DescribeAlarms` | ECR push; staging |
 | Validation | pull-request validation project | Its log group and report group | Everything else |
-| DB admin (`mobile-api-db-admin`) | one-off creation of the application role in RDS | Read `/mobile-api/staging/rds-master` and the `DATABASE_URL` key of `/mobile-api/staging/runtime`; VPC network interfaces; its log group | ECR, EKS, S3 |
-| Integration (`mobile-api-integration`) | `python -m app.migrate` and `tests/integration` against RDS | Read `DATABASE_URL` from `/mobile-api/staging/runtime`; VPC network interfaces; its log group and report group | The master secret; ECR push; EKS |
+| DB admin (`mobile-api-db-admin`) | one-off creation of the application role in RDS | Read `/mobile-api/staging/rds-master` and the whole `/mobile-api/staging/runtime` secret (IAM cannot scope to a JSON key; the buildspec selects `DATABASE_URL`); VPC network interfaces; its log group | ECR, EKS, S3 |
+| Integration (`mobile-api-integration`) | `python -m app.migrate` and `tests/integration` against RDS | Read the whole `/mobile-api/staging/runtime` secret (the buildspec selects `DATABASE_URL`); VPC network interfaces; its log group and report group | The master secret; ECR push; EKS |
 
 The build, validation, db-admin, and integration roles are provisioned by
 [infra/](../infra/README.md) (CDK). The two deploy roles are proposed.
@@ -170,7 +170,7 @@ by a `RoleBinding` in each environment's namespace, so each group can act only
 in its own namespace. The role allows:
 
 - full management of only the kinds the chart renders: ServiceAccounts,
-  Services, Deployments, HPAs, PDBs, and CronJobs;
+  Services, Deployments, HPAs, PDBs, CronJobs, and Ingresses;
 - Jobs, for the migration hook and for manual staging batch runs;
 - ConfigMaps, for Helm's release history;
 - read-only access to ReplicaSets, Pods, Events, and pod logs, to wait for and
@@ -200,8 +200,8 @@ deployer's.
 Trade-offs of this tighter option:
 
 - **New kinds need an RBAC change.** Each kind the chart adds needs a
-  cluster-administrator change, for example an Ingress, or custom resources
-  such as `ExternalSecret`. The chart tests fail until the role covers every
+  cluster-administrator change, for example custom resources such as
+  `ExternalSecret`. The chart tests fail until the role covers every
   rendered kind, so the gap shows up in a pull request, not in a failed
   deployment.
 - **Release history is readable.** Anyone who can read ConfigMaps in the
@@ -475,7 +475,9 @@ unpredictable.
   are what make that safe.
 - Schema changes are backward compatible (expand, then contract):
   - A release may only add: new tables, nullable columns, and indexes built
-    concurrently.
+    concurrently. `CREATE INDEX CONCURRENTLY` cannot run inside a transaction,
+    so such a migration file starts with `-- migrate: no-transaction` and holds
+    that one statement; the runner records it only after it succeeds.
   - The code works with both the old and the new schema.
   - Drops and renames ship in a later release, once neither the running
     version nor the rollback target uses the old shape.
@@ -601,7 +603,7 @@ data point counts as breaching; missing 5xx data does not.
 | EKS Auto Mode cluster `mobile-api-staging`, `mobile-api-deploy-staging`, `mobile-api-secrets-sync` | Being provisioned by infra/ (CDK); in progress. Nothing deployed to it yet. |
 | Demo application (PostgreSQL persistence, migration, batch replay) and container image | Implemented. Unit-tested, built, and checked locally with Podman against a PostgreSQL 17 container. |
 | Chart, app, integration, and secrets-loader tests; container check; smoke test; secret scan; buildspecs | Implemented and run locally. |
-| ECR repository, CodeConnections connection, CodeBuild validate and build projects | Provisioned by infra/ (CDK). |
+| ECR repository, CodeConnections connection, CodeBuild validate and build projects | Provisioned by infra/ (CDK). `mobile-api-validate` has run on a pull request through the GitHub App webhook; `mobile-api-build` has built, checked, and pushed an image tagged by commit SHA. |
 | Staging VPC, RDS PostgreSQL 17 instance, db-admin and integration runners | Provisioned by infra/ (CDK). Integration tests against RDS pending the operator steps. |
 | Secrets loader (`scripts/load_secrets.py`) | Implemented. Offline tests only. Never run against AWS by the agent. |
 | Deployer RBAC (`platform/deploy-rbac.yaml`) | Written, schema-validated, and checked against the rendered chart. Not applied to any cluster. |

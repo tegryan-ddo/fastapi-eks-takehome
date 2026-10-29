@@ -22,7 +22,7 @@ nothing about payment processing or the employer's business logic.
 ## Setup
 
 Python 3.12 or later, network access on the first run, and Docker or Podman for
-the container check (it also pulls `postgres:17-alpine`).
+the container check (it also pulls `public.ecr.aws/docker/library/postgres:17.11-alpine`).
 
 ```sh
 python -m pip install -r requirements-dev.txt
@@ -30,8 +30,8 @@ python scripts/tools.py
 ```
 
 `scripts/tools.py` downloads pinned releases of Helm (v4.3.1), kubeconform
-(v0.8.0), and gitleaks (v8.30.1) into `.tools/`. It checks each archive against
-a SHA-256 stored in the script before unpacking it. kubeconform also fetches
+(v0.8.0), gitleaks (v8.30.1), and kubectl (v1.37.2) into `.tools/`. It checks
+each file against a SHA-256 stored in the script before unpacking it. kubeconform also fetches
 Kubernetes JSON schemas from GitHub when it runs.
 
 ## Checks that run now
@@ -46,8 +46,10 @@ Kubernetes JSON schemas from GitHub when it runs.
 `buildspecs/validate.yml` runs `pytest` and the secret scan in CodeBuild on
 pull requests; without a database, the integration tests do not run there.
 `buildspecs/build.yml` runs those plus the container check, then pushes the
-image. Both projects are provisioned by infra/ (CDK). No AWS build result is
-recorded in this document.
+image. Both projects are provisioned by infra/ (CDK) and have run:
+`mobile-api-validate` succeeded on a pull-request webhook, and
+`mobile-api-build` built, checked (26/26 container checks against PostgreSQL in
+Docker), and pushed the image for commit `73de0a8`.
 
 ### Relationship checks (`tests/chart/test_chart.py`)
 
