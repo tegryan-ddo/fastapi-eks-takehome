@@ -1,6 +1,8 @@
 # Staging overrides for charts/mobile-api/values.yaml.
 # The image tag or digest is supplied at deploy time, not stored here.
 
-# Illustrative starting point, not a capacity figure. Autoscaling replaces
-# this in the next increment.
-replicaCount: 2
+batch:
+  # Staging: suspend scheduled runs and validate this release with a manual Job.
+  # Verify business output and safe replay against staging data before promotion.
+  # Manual Jobs are outside this CronJob's Forbid concurrency protection.
+  suspend: true

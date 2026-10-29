@@ -6,7 +6,11 @@ metadata:
     {{- include "mobile-api.labels" . | nindent 4 }}
     app.kubernetes.io/component: api
 spec:
-  replicas: {{ .Values.replicaCount }}
+  # With autoscaling, replicas is omitted so an upgrade does not reset the
+  # replica count the HPA is managing.
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.api.replicaCount }}
+  {{- end }}
   selector:
     matchLabels:
       {{- include "mobile-api.selectorLabels" . | nindent 6 }}
@@ -26,13 +30,9 @@ spec:
       serviceAccountName: {{ include "mobile-api.fullname" . }}
       # The API does not call the Kubernetes API.
       automountServiceAccountToken: false
-      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ .Values.api.terminationGracePeriodSeconds }}
       securityContext:
-        runAsNonRoot: true
-        runAsUser: 10001
-        runAsGroup: 10001
-        seccompProfile:
-          type: RuntimeDefault
+        {{- include "mobile-api.podSecurityContext" . | nindent 8 }}
       containers:
         - name: api
           image: {{ include "mobile-api.image" . | quote }}
@@ -41,25 +41,25 @@ spec:
             - name: http
               containerPort: 8000
               protocol: TCP
+          {{- if and .Values.runtimeSecret.name .Values.api.secretKeys }}
+          {{- include "mobile-api.secretEnv" (dict "secret" .Values.runtimeSecret.name "keys" .Values.api.secretKeys) | nindent 10 }}
+          {{- end }}
           startupProbe:
-            {{- toYaml .Values.startupProbe | nindent 12 }}
+            {{- toYaml .Values.api.startupProbe | nindent 12 }}
           readinessProbe:
-            {{- toYaml .Values.readinessProbe | nindent 12 }}
+            {{- toYaml .Values.api.readinessProbe | nindent 12 }}
           livenessProbe:
-            {{- toYaml .Values.livenessProbe | nindent 12 }}
+            {{- toYaml .Values.api.livenessProbe | nindent 12 }}
           resources:
-            {{- toYaml .Values.resources | nindent 12 }}
+            {{- toYaml .Values.api.resources | nindent 12 }}
           securityContext:
-            allowPrivilegeEscalation: false
-            readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
+            {{- include "mobile-api.containerSecurityContext" . | nindent 12 }}
           lifecycle:
             # Keep serving while the pod is removed from Service endpoints,
             # then Uvicorn receives SIGTERM and drains in-flight requests.
             preStop:
               sleep:
-                seconds: {{ .Values.preStopSleepSeconds }}
+                seconds: {{ .Values.api.preStopSleepSeconds }}
           volumeMounts:
             - name: tmp
               mountPath: /tmp
