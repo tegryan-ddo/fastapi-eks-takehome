@@ -3,15 +3,54 @@
 What can be checked today, what each check is meant to catch, and the checks
 that still need RDS, a cluster, or the real application.
 
+## Submission v2 evidence
+
+Chart and delivery source: `643dbb755d4c18db2b12986c204c7fc0e28eb1d8`.
+These AWS build statuses were reported for the revisions shown; they are not
+all runs of the same revision.
+
+| Build | Source revision | Reported status | Build ID |
+| --- | --- | --- | --- |
+| Validation | `643dbb7` | Succeeded | `cb87b2e3-5aab-40ef-af95-9f7de6ae640f` |
+| Staging deployment | `643dbb7` | Succeeded | `f0526314-041d-423e-b294-8a67c39dae4f` |
+| Image build | `61fb83d` | Succeeded | `6b1a85ac-3fda-44f2-97b2-cd44c9a68dbd` |
+| Bootstrap | `73de0a8` | Succeeded | `6f6c2137-f44a-4457-8706-53282bbf7e0a` |
+| Secrets sync | `73de0a8` | Succeeded | `1de29198-37ef-41a8-bc68-9a2a9855dbad` |
+| RDS integration | `73de0a8` | Succeeded | `d3bd2a66-e146-4c60-a4a8-800b0a0c0da0` |
+
+Raw build logs and JUnit reports were not available for this snapshot. These
+are overall build receipts plus the configured checks described below, not
+independently reviewed individual test results. The earlier integration run
+is evidence at `73de0a8`, not a claim that its suite ran again at `643dbb7`.
+See the [README](../README.md) for the submission scope.
+
+### Independently observed public HTTPS checks
+
+On 28 October 2026 (America/Vancouver), three read-only requests to
+[the staging hostname](https://mobile-api-staging.digitaldevops.io) succeeded
+with TLS certificate verification enabled:
+
+| Path | HTTP status | Response |
+| --- | --- | --- |
+| `/` | 200 | `{"service":"demo-api","version":"0.1.0-61fb83d","demo":true}` |
+| `/health/ready` | 200 | `{"status":"ready"}` |
+| `/health/live` | 200 | `{"status":"ok"}` |
+
+These establish public HTTPS reachability, the reported application identity,
+and health at that time. They do not independently demonstrate writes, batch
+output, sustained capacity, or rollout continuity. The reported version is
+not an image digest. The staging build compares runtime image IDs with its
+resolved ECR digest, but the exact digest was not captured in this record.
+
 There are five levels of evidence. Keep them apart:
 
 | Level | Status |
 | --- | --- |
-| Unit tests (demo app, secrets loader) | Run locally |
-| Rendered manifests (lint, schema, relationships) | Run locally |
-| Local container (image built and run with Docker or Podman; a PostgreSQL 17 container stands in for RDS) | Run locally |
-| RDS (the real database, through the VPC-connected `mobile-api-integration` runner) | **Not yet run.** Pending the operator steps in the README. |
-| Kubernetes cluster (install, migration hook, rollout, CronJob, HPA, Ingress) | **Not run.** An EKS Auto Mode cluster is being provisioned by infra/; nothing has run on it yet. |
+| Unit tests (demo app, secrets loader) | Configured in the validation build, which reports success at `643dbb7`; not rerun during snapshot preparation. |
+| Rendered manifests (lint, schema, relationships) | Configured in that validation build; raw per-check output was not inspected here. |
+| Local container (image built and run with Docker or Podman; a PostgreSQL 17 container stands in for RDS) | Configured in the image build, which reports success at `61fb83d`; no independent per-check count is claimed. |
+| RDS (the real database, through the VPC-connected `mobile-api-integration` runner) | Integration build reports success at `73de0a8`; its JUnit report and logs were not inspected here. |
+| Kubernetes cluster (install, migration hook, rollout, CronJob, HPA, Ingress) | Staging deployment build reports success at `643dbb7`; public HTTPS identity and health were independently observed. The acceptance scenarios below remain separately tracked. |
 
 A local HTTP response does not show that ALB routing, DNS, TLS, or rollout
 behaviour work. A passing check against the PostgreSQL container does not show
@@ -31,8 +70,8 @@ python scripts/tools.py
 
 `scripts/tools.py` downloads pinned releases of Helm (v4.3.1), kubeconform
 (v0.8.0), gitleaks (v8.30.1), and kubectl (v1.37.2) into `.tools/`. It checks
-each file against a SHA-256 stored in the script before unpacking it. kubeconform also fetches
-Kubernetes JSON schemas from GitHub when it runs.
+each file against a SHA-256 stored in the script before unpacking it.
+kubeconform also fetches Kubernetes JSON schemas from GitHub when it runs.
 
 ## Checks that run now
 
@@ -46,10 +85,19 @@ Kubernetes JSON schemas from GitHub when it runs.
 `buildspecs/validate.yml` runs `pytest` and the secret scan in CodeBuild on
 pull requests; without a database, the integration tests do not run there.
 `buildspecs/build.yml` runs those plus the container check, then pushes the
-image. Both projects are provisioned by infra/ (CDK) and have run:
-`mobile-api-validate` succeeded on a pull-request webhook, and
-`mobile-api-build` built, checked (26/26 container checks against PostgreSQL in
-Docker), and pushed the image for commit `73de0a8`.
+image. Both projects are defined by infra/ (CDK). Overall AWS build statuses
+are recorded above; their raw logs and individual test results were not
+reviewed while preparing this snapshot.
+
+`buildspecs/deploy-staging.yml` is configured to run the migration hook through
+Helm, wait for the Deployment rollout, and compare the image IDs of Running,
+non-terminating API pods with the resolved ECR digest. With HTTPS configured,
+it runs the smoke test and an HTTP write/read through the public hostname;
+otherwise it uses a check Job against the in-cluster Service. It then creates
+one manual batch Job, waits for completion, prints its logs, and checks its
+image digest. A successful build reports completion of this configured flow.
+It does not assert the batch's persisted business output, replay the staging
+batch, or measure request errors throughout a rolling deployment.
 
 ### Relationship checks (`tests/chart/test_chart.py`)
 
@@ -72,8 +120,9 @@ These are relationships a schema validator cannot see:
 | `platform/deploy-rbac.yaml` passes schema validation and grants full management of every kind the chart can render, including the Ingress, plus ConfigMaps | A chart change that would fail in the pipeline with "forbidden". |
 | The deployer role has no wildcards, Secrets, pod `exec`, `attach`, or `port-forward`, impersonation, or RBAC rights; it is granted only through namespaced RoleBindings; each environment has its own group | Permission creep. A ClusterRoleBinding granting every namespace. One deploy role able to deploy to both environments. |
 
-Each check was confirmed to fail, with its message, against a deliberately
-broken copy of the chart.
+The earlier verification notes report that each relationship check was
+exercised against a deliberately broken chart copy. Those failure checks were
+not rerun while preparing this snapshot.
 
 ### Container checks (`scripts/verify_container.py`)
 
@@ -106,23 +155,29 @@ broken copy of the chart.
 
 ## Checks against RDS
 
-None has run. All of them wait for the operator steps in the README: load the
-secret, start `mobile-api-db-admin` once, then start `mobile-api-integration`.
+The `mobile-api-integration` build reports success at `73de0a8` (ID above).
+Its buildspec runs the migration against the configured RDS database and then
+`pytest tests/integration`, exporting a JUnit report. That report and the raw
+logs were not available here; statuses below distinguish configured coverage
+from independently reviewed output. Local PostgreSQL checks remain separate
+from this RDS evidence.
 
 | Check | How | Status |
 | --- | --- | --- |
-| Migration over TLS (`sslmode=verify-full`) against RDS as `mobile_api_app` | `mobile-api-integration` runner: `python -m app.migrate` | Pending |
-| Write then read through the application's database code | `tests/integration` in the runner | Pending |
-| Batch run and replay for one business date: one `batch_runs` row, `run_count` 2 | `tests/integration` in the runner | Pending |
-| Second run of the migration is a no-op | Start the runner again | Pending |
-| Record survives a pod replacement | Needs a cluster: `POST`, `kubectl rollout restart`, `GET` | Pending: needs cluster |
-| Readiness fails, liveness holds, no restarts, automatic recovery, against RDS | Needs a cluster: remove and restore the 5432 security-group rule | Pending: needs cluster |
+| Migration over TLS (`sslmode=verify-full`) against RDS as `mobile_api_app` | `mobile-api-integration` runner: `python -m app.migrate` | Configured in successful integration build at `73de0a8`; raw output not reviewed |
+| Write then read through the application's database code | `tests/integration` in the runner | Configured in successful integration build at `73de0a8`; JUnit not reviewed |
+| Batch run and replay for one business date: one `batch_runs` row, `run_count` 2 | `tests/integration` in the runner | Configured in successful integration build at `73de0a8`; JUnit not reviewed; this is not a staging CronJob replay |
+| Second run of the migration is a no-op | Start the runner again | Separate repeat-run result not recorded |
+| Record survives a pod replacement | `POST`, `kubectl rollout restart`, `GET` | Outstanding; the deployment build does not perform this persistence sequence |
+| Readiness fails, liveness holds, no restarts, automatic recovery, against RDS | Controlled staging database-connectivity failure and restoration | Outstanding; no live RDS outage/recovery result recorded |
 
 ## Manual staging batch run
 
-The CronJob `mobile-api-batch` is deployed in staging with `suspend: true`, so
-nothing runs on a schedule. Before promotion, run one Job from its current
-template:
+The staging CronJob `mobile-api-batch` is configured with `suspend: true`, so
+it does not run on a schedule. The successful staging deployment build is
+configured to create one manual Job and wait for completion. That is a batch
+execution smoke check; the persisted output and same-date replay checks below
+still need to be completed before promotion:
 
 ```sh
 NS=mobile-api-staging
@@ -186,17 +241,19 @@ pipeline's verify-staging step can run these commands.
 
 ## Staging acceptance plan
 
-None of these has been executed. Scenarios 1, 4, 6, and 7 can run with the demo
-once a cluster exists. Scenarios 2 and 3 need the real application and the
-payment-provider contract. Scenario 5 needs a deliberately slow endpoint, which
-the demo lacks.
+The successful staging deployment covers a subset of scenarios 1 and 4 as
+configured below; it does not establish that any full scenario passed. Public
+HTTPS identity and health were independently checked, but writes and batch
+execution here rely on the build receipt and configured flow. Scenarios 2 and
+3 need the real application and payment-provider contract. Scenario 5 needs a
+deliberately slow endpoint, which the demo lacks.
 
 | # | Scenario | Action | Assertions | Status |
 | --- | --- | --- | --- | --- |
-| 1 | Real database read and write | `POST /demo/records` with a unique note through the staging hostname; `GET /demo/records/{id}`; `kubectl rollout restart deployment/mobile-api` and wait; the same `GET` again. | `201`, then the same record twice, including after every pod was replaced. The database pool wait metric stays below its threshold. The record is synthetic and is removed afterwards through the integration runner, not the API. For the real application, the same against its own endpoints and schema. | Implementable with the demo. Unexecuted: needs cluster |
+| 1 | Real database read and write | `POST /demo/records` with a unique note through the staging hostname; `GET /demo/records/{id}`; `kubectl rollout restart deployment/mobile-api` and wait; the same `GET` again. | `201`, then the same record twice, including after every pod was replaced. The database pool wait metric stays below its threshold. The record is synthetic and is removed afterwards through the integration runner, not the API. For the real application, the same against its own endpoints and schema. | Partial configured coverage: HTTP write/read in the successful staging build; replacement persistence and pool metrics remain unchecked |
 | 2 | Duplicate webhook | Send one correctly signed test event (provider sandbox, or a locally signed payload with the staging secret) twice. | Both deliveries get the status the provider expects. Exactly one business effect, for example one payment-state transition. The second delivery is recorded as a duplicate. The completion metric increases by one. | Unexecuted: needs real app and provider contract |
 | 3 | Invalid-signature webhook | Send the same event with a tampered body, and again signed with the wrong secret. | Rejected with the agreed 4xx. No state change. The signature-rejected metric increases. The payload and signature are not logged. | Unexecuted: needs real app and provider contract |
-| 4 | Batch output and replay for the same business period | Run a manual Job for period P (above), then another for P. | Both Jobs complete with the release digest. `GET /demo/batch-runs/P` returns one row with `run_count: 2` and the same `record_count`; the second Job logs the replay. For the real application: the expected business output for P, and no duplicate output after the replay. | Implementable with the demo. Unexecuted: needs cluster |
-| 5 | Rollout with requests in flight | Hold steady load, including requests longer than 5s, on the staging HTTPS hostname while `helm upgrade` replaces every pod. | No 5xx and no connection errors. Every slow request completes. Ready replicas never drop below the current count. | Unexecuted: needs cluster and slow endpoint |
-| 6 | Unhealthy replacement | Deploy a release whose readiness can never pass, for example `--set api.readinessProbe.httpGet.path=/not-ready`. | New pods stay unready and receive no traffic. Old pods keep serving, so the smoke test passes throughout. `helm upgrade --rollback-on-failure` fails at its timeout and restores the previous revision. The pipeline stage fails. | Unexecuted: needs cluster |
-| 7 | Database outage and recovery | Remove the security-group rule that allows the pods to reach RDS on 5432; after a few minutes, restore it. | Within about 10s every pod is NotReady with reason `database unavailable`, the Service has no endpoints, and `/health/live` still returns 200 from inside the cluster. Restart counts do not change. Within about 10s of the rule returning, every pod is Ready again without a restart. | Implementable with the demo. Unexecuted: needs cluster |
+| 4 | Batch output and replay for the same business period | Run a manual Job for period P (above), then another for P. | Both Jobs complete with the release digest. `GET /demo/batch-runs/P` returns one row with `run_count: 2` and the same `record_count`; the second Job logs the replay. For the real application: the expected business output for P, and no duplicate output after the replay. | Partial configured coverage: one manual Job completes in the successful staging build; persisted output and same-date staging replay remain unchecked |
+| 5 | Rollout with requests in flight | Hold steady load, including requests longer than 5s, on the staging HTTPS hostname while `helm upgrade` replaces every pod. | No 5xx and no connection errors. Every slow request completes. Ready replicas never drop below the current count. | Outstanding: controlled rollout under load, including a slow endpoint |
+| 6 | Unhealthy replacement | Deploy a release whose readiness can never pass, for example `--set api.readinessProbe.httpGet.path=/not-ready`. | New pods stay unready and receive no traffic. Old pods keep serving, so the smoke test passes throughout. `helm upgrade --rollback-on-failure` fails at its timeout and restores the previous revision. The pipeline stage fails. | Outstanding: deliberately unhealthy replacement and rollback test |
+| 7 | Database outage and recovery | Remove the security-group rule that allows the pods to reach RDS on 5432; after a few minutes, restore it. | Within about 10s every pod is NotReady with reason `database unavailable`, the Service has no endpoints, and `/health/live` still returns 200 from inside the cluster. Restart counts do not change. Within about 10s of the rule returning, every pod is Ready again without a restart. | Outstanding: controlled RDS outage and recovery test |

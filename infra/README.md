@@ -1,11 +1,19 @@
 # AWS resources for the take-home
 
-A CDK app (Python) that provisions the AWS side of this exercise in account
-`882384879235`, region `us-east-1`. It covers the build path, the database that
-stands in for the external PostgreSQL dependency, and a staging EKS cluster with
-the projects that deploy to it. It does **not** create the release pipeline,
-production, or monitoring; those remain proposals in
-[docs/operations.md](../docs/operations.md).
+A CDK app (Python) defining the AWS side of this exercise in account
+`882384879235`, region `us-east-1`. It covers the build path, the database
+that stands in for the external PostgreSQL dependency, and a staging EKS Auto
+Mode cluster with deployment and secrets-sync projects. The full release
+pipeline, production deployment, and application monitoring remain proposals
+in [docs/operations.md](../docs/operations.md).
+
+**Submission snapshot: `643dbb7`.** Validation and staging-deployment builds
+from this source succeeded. Database-bootstrap, RDS-integration, and secrets-sync
+builds succeeded from source `73de0a8`. Staging identity, liveness, and readiness
+were observed over verified HTTPS on 28 October 2026 (Pacific), with reported
+application version `0.1.0-61fb83d`. See the [submission status](../README.md)
+for exact run references and image provenance. Production, peak-load, and
+real-payment verification are outside this evidence.
 
 | Stack | Creates | Why |
 | --- | --- | --- |
@@ -15,12 +23,12 @@ production, or monitoring; those remain proposals in
 | `MobileApiIntegration` | CodeBuild `mobile-api-db-admin` (one-off: creates the application role) and `mobile-api-integration` (migrations and integration tests against RDS). Both run in the `runners` subnets, started by hand. | The only paths into the private database. |
 | `MobileApiEks` | EKS Auto Mode cluster `mobile-api-staging` (Kubernetes 1.37, `system` and `general-purpose` node pools, built-in load balancing and block storage, API and audit logs). Access entries for the cluster admin, the deploy role and the secrets-sync role. The database security group opens 5432 to the cluster security group. CodeBuild `mobile-api-secrets-sync` and `mobile-api-deploy-staging`. Optionally an ACM certificate and Route53 permissions. | The staging cluster the chart deploys to; see the section below. |
 
-Every CodeBuild role is limited to its job: the build role can push to the one
-ECR repository and nothing else; the integration role can read only the
-runtime secret; only the db-admin role can read the master secret; the deploy
-and secrets-sync roles hold `eks:DescribeCluster` on the staging cluster and
-nothing else in EKS, and their Kubernetes permissions come from access entries
-bound to the namespaced RBAC in `platform/`.
+CodeBuild roles are separated by job. The build role can push to the one
+ECR repository; the integration role reads the runtime secret; only the
+db-admin runner reads the master secret. The build and database runners have
+no cluster access. The staging deploy and secrets-sync roles hold
+`eks:DescribeCluster` on the staging cluster, and their Kubernetes permissions
+come from access entries bound to the namespaced RBAC in `platform/`.
 
 ## Deploy
 
@@ -72,9 +80,10 @@ npx aws-cdk@2.1146.1 deploy MobileApiDatabase -c eksWorkloadSecurityGroupId=sg-0
 ## EKS cluster and staging deployment
 
 `MobileApiEks` creates the staging cluster with EKS Auto Mode, so AWS runs the
-nodes, the VPC CNI, CoreDNS, EBS and the load-balancer controller; nothing is
-installed into the cluster by this repository except the manifests under
-`platform/`. Authentication mode is `API` only and the creating identity gets
+nodes, the VPC CNI, CoreDNS, EBS and the load-balancer controller. Cluster
+bootstrap applies the manifests under `platform/`; the staging deploy
+project installs the application's Helm chart. Authentication mode is `API`
+only and the creating identity gets
 no implicit access: the three access entries are the whole list.
 
 | Principal | Access entry | Kubernetes permissions |
@@ -173,3 +182,4 @@ created. The ECR repository is retained (delete it by hand after removing its
 images), the RDS instance is replaced by a final snapshot, and the master
 secret is deleted with the instance. The connection and the GitHub App
 installation are removed separately.
+
