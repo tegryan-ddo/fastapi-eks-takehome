@@ -3,6 +3,8 @@
 .env.*
 *.pem
 *.key
+# Public RDS certificate authorities, copied into the image. Not a credential.
+!examples/demo-api/certs/rds-global-bundle.pem
 kubeconfig
 *.kubeconfig
 .kube/
