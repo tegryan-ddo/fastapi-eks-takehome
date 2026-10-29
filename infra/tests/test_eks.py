@@ -139,3 +139,11 @@ def test_https_context_without_certificate_requests_a_dns_validated_one():
         "DomainValidationOptions": [{"DomainName": context["domainName"], "HostedZoneId": context["hostedZoneId"]}],
         "ValidationMethod": "DNS",
     })
+
+
+def test_metrics_server_addon_backs_the_hpa(template):
+    template.has_resource_properties("AWS::EKS::Addon", {
+        "AddonName": "metrics-server",
+        "AddonVersion": "v0.9.0-eksbuild.14",
+        "ClusterName": {"Ref": next(iter(template.find_resources("AWS::EKS::Cluster")))},
+    })

@@ -90,6 +90,12 @@ class EksStack(cdk.Stack):
             )),
         )
 
+        # Auto Mode does not include metrics-server; the HPA reads CPU from it.
+        eks.CfnAddon(
+            self, "MetricsServer",
+            cluster_name=cluster.ref, addon_name="metrics-server", addon_version="v0.9.0-eksbuild.14",
+        )
+
         # Auto Mode nodes carry the cluster security group, so pods reach RDS through it.
         ec2.CfnSecurityGroupIngress(
             self, "DatabaseFromCluster",
