@@ -1,12 +1,14 @@
 """Download the pinned verification tools into .tools/ and return their paths.
 
-Each archive is checked against the SHA-256 pinned below before it is unpacked.
+Each download is checked against the SHA-256 pinned below before it is unpacked.
 Run directly to install every tool for the current platform:
 
-    python scripts/tools.py
+    python scripts/tools.py            # prints "tool: path" lines
+    python scripts/tools.py --path     # prints a PATH fragment with every tool
 """
 
 import hashlib
+import os
 import platform
 import shutil
 import sys
@@ -53,6 +55,18 @@ PINNED = {
             ("windows", "amd64"): ("gitleaks_8.30.1_windows_x64.zip", "d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e"),
         },
     ),
+    # Published as a bare executable, not an archive; one minor version of the cluster.
+    "kubectl": (
+        "v1.37.2",
+        "https://dl.k8s.io/release/v1.37.2/bin/{archive}",
+        {
+            ("linux", "amd64"): ("linux/amd64/kubectl", "c04487523e7aa7d1493f7808174c899db93d7a9cf57531420cd76b9bd415f8f4"),
+            ("linux", "arm64"): ("linux/arm64/kubectl", "fcc16f63186659d9722014b7e02d5fdd2d4e669cb8c0ab66365d7d3b8ba03509"),
+            ("darwin", "amd64"): ("darwin/amd64/kubectl", "88379aff5c8111de6be0a394adffba2819e44cde269f3ab23cef76de1a48eaa8"),
+            ("darwin", "arm64"): ("darwin/arm64/kubectl", "55701af0d51815ee335f240e48acf0959c3c23017ed3fa816e880c4a92bae581"),
+            ("windows", "amd64"): ("windows/amd64/kubectl.exe", "1691938f7de0e931969f9968c3601cf32d6b0d573573afb4ce471f3d28f51984"),
+        },
+    ),
 }
 
 
@@ -77,7 +91,7 @@ def path(tool):
     archive, expected = archives[(os_name, arch)]
     print(f"Downloading {tool} {version} ({archive})", file=sys.stderr)
     with tempfile.TemporaryDirectory() as tmp:
-        download = Path(tmp) / archive
+        download = Path(tmp) / Path(archive).name
         with urllib.request.urlopen(url.format(archive=archive), timeout=60) as response:
             download.write_bytes(response.read())
 
@@ -89,9 +103,12 @@ def path(tool):
         if archive.endswith(".zip"):
             with zipfile.ZipFile(download) as z:
                 z.extractall(unpacked)
-        else:
+        elif archive.endswith(".tar.gz"):
             with tarfile.open(download) as t:
                 t.extractall(unpacked, filter="data")
+        else:
+            unpacked.mkdir()
+            download.rename(unpacked / binary)
 
         found = next(unpacked.rglob(binary), None)
         if found is None:
@@ -103,5 +120,8 @@ def path(tool):
 
 
 if __name__ == "__main__":
-    for name in PINNED:
-        print(f"{name}: {path(name)}")
+    if sys.argv[1:] == ["--path"]:
+        print(os.pathsep.join(str(Path(path(name)).parent) for name in PINNED))
+    else:
+        for name in PINNED:
+            print(f"{name}: {path(name)}")

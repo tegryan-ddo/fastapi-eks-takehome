@@ -10,10 +10,15 @@ Stacks, in dependency order:
                         on pushes to main
   MobileApiIntegration  CodeBuild in the VPC: one-off database bootstrap, and
                         integration tests against RDS
+  MobileApiEks          EKS Auto Mode cluster for staging, access entries, and
+                        the CodeBuild projects that sync the runtime secret
+                        and deploy the chart (see infra/eks_stack.py for the
+                        HTTPS context values)
 """
 
 import aws_cdk as cdk
 
+from eks_stack import EksStack
 from stacks import BuildStack, DatabaseStack, FoundationStack, IntegrationStack
 
 ENV = cdk.Environment(account="882384879235", region="us-east-1")
@@ -34,5 +39,11 @@ IntegrationStack(
     connection_arn=foundation.connection_arn,
     vpc=database.vpc, runner_security_group=database.runner_security_group,
     master_secret=database.master_secret,
+)
+EksStack(
+    app, "MobileApiEks", env=ENV,
+    github_owner=GITHUB_OWNER, github_repo=GITHUB_REPO,
+    connection_arn=foundation.connection_arn, repository=foundation.repository,
+    vpc=database.vpc, database_security_group=database.database_security_group,
 )
 app.synth()

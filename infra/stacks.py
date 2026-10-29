@@ -151,13 +151,21 @@ def github_project(scope, id, *, name, owner, repo, buildspec, connection_arn, p
     project.node.default_child.add_property_override(
         "Source.Auth", {"Type": "CODECONNECTIONS", "Resource": connection_arn},
     )
-    project.add_to_role_policy(iam.PolicyStatement(
-        actions=[
-            "codeconnections:GetConnection", "codeconnections:GetConnectionToken",
-            "codestar-connections:GetConnection", "codestar-connections:GetConnectionToken",
-        ],
-        resources=[connection_arn],
-    ))
+    # CodeBuild checks, as the project role, that it can read the connection
+    # while creating the project. The grant lives in its own policy so the
+    # project can depend on it; the role's default policy references the
+    # project, so depending on that would be a cycle.
+    connection_access = iam.Policy(
+        scope, f"{id}ConnectionAccess", roles=[project.role],
+        statements=[iam.PolicyStatement(
+            actions=[
+                "codeconnections:GetConnection", "codeconnections:GetConnectionToken",
+                "codestar-connections:GetConnection", "codestar-connections:GetConnectionToken",
+            ],
+            resources=[connection_arn],
+        )],
+    )
+    project.node.default_child.add_dependency(connection_access.node.default_child)
     return project
 
 

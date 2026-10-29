@@ -1,0 +1,22 @@
+# Ingress class served by EKS Auto Mode's built-in load balancing. Applied once
+# by a cluster administrator. The chart's Ingress names it (ingress.className:
+# alb); listeners, certificate and health check come from annotations on that
+# Ingress, set by buildspecs/deploy-staging.yml.
+# https://docs.aws.amazon.com/eks/latest/userguide/auto-configure-alb.html
+apiVersion: eks.amazonaws.com/v1
+kind: IngressClassParams
+metadata:
+  name: alb
+spec:
+  scheme: internet-facing
+---
+apiVersion: networking.k8s.io/v1
+kind: IngressClass
+metadata:
+  name: alb
+spec:
+  controller: eks.amazonaws.com/alb
+  parameters:
+    apiGroup: eks.amazonaws.com
+    kind: IngressClassParams
+    name: alb

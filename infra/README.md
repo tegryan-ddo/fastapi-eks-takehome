@@ -12,6 +12,7 @@ proposals in [docs/operations.md](../docs/operations.md).
 | `MobileApiDatabase` | VPC `mobile-api` (10.60.0.0/16, two AZs, one NAT gateway; public, `runners`, and isolated `database` subnets). RDS PostgreSQL 17.11 `mobile-api-staging`, db.t4g.micro, 20 GiB gp3, encrypted, not public, TLS required (`rds.force_ssl`), CA `rds-ca-rsa2048-g1`, master credentials generated into secret `/mobile-api/staging/rds-master`. Security group opening 5432 only to the runners (and to an EKS workload security group when given as context). | Reproduces the external database with private connectivity. |
 | `MobileApiBuild` | CodeBuild `mobile-api-validate` (pull requests, `buildspecs/validate.yml`) and `mobile-api-build` (pushes to `main`, `buildspecs/build.yml`, privileged for Docker, pushes images by commit SHA). | Verification and image delivery. |
 | `MobileApiIntegration` | CodeBuild `mobile-api-db-admin` (one-off: creates the application role) and `mobile-api-integration` (migrations and integration tests against RDS). Both run in the `runners` subnets, started by hand. | The only paths into the private database. |
+| `MobileApiEks` | EKS Auto Mode cluster `mobile-api-staging` (Kubernetes 1.37, `system` and `general-purpose` node pools, built-in load balancing and block storage, API and audit logs). Access entries for the cluster admin, the deploy role and the secrets-sync role. The database security group opens 5432 to the cluster security group. CodeBuild `mobile-api-secrets-sync` and `mobile-api-deploy-staging`. Optionally an ACM certificate and Route53 permissions. | The staging cluster the chart deploys to; see the section below. |
 
 Every CodeBuild role is limited to its job: the build role can push to the one
 ECR repository and nothing else; the integration role can read only the
@@ -65,14 +66,96 @@ npx aws-cdk@2.1146.1 deploy MobileApiDatabase -c eksWorkloadSecurityGroupId=sg-0
 3. Run the schema and the integration tests:
    `aws codebuild start-build --project-name mobile-api-integration`.
 
+## EKS cluster and staging deployment
+
+`MobileApiEks` creates the staging cluster with EKS Auto Mode, so AWS runs the
+nodes, the VPC CNI, CoreDNS, EBS and the load-balancer controller; nothing is
+installed into the cluster by this repository except the manifests under
+`platform/`. Authentication mode is `API` only and the creating identity gets
+no implicit access: the three access entries are the whole list.
+
+| Principal | Access entry | Kubernetes permissions |
+| --- | --- | --- |
+| `arn:aws:iam::882384879235:user/teg` (override with `-c clusterAdminPrincipalArn=…`) | `AmazonEKSClusterAdminPolicy`, cluster scope | Everything; used only for the one-time bootstrap below |
+| `mobile-api-deploy-staging` role | group `mobile-api-staging-deployers` | [`platform/deploy-rbac.yaml`](../platform/deploy-rbac.yaml): the chart's kinds, Jobs, ConfigMaps, pod logs; no Secrets, no exec, no port-forward |
+| `mobile-api-secrets-sync` role | group `mobile-api-staging-secrets` | [`platform/eks/secrets-sync-rbac.yaml`](../platform/eks/secrets-sync-rbac.yaml): the one Secret `mobile-api-runtime`, and a restart of the one Deployment |
+
+Two simplifications against [docs/operations.md](../docs/operations.md): the
+API endpoint is public as well as private, so the deploy and secrets-sync
+projects run outside the VPC (section 3 describes the private-endpoint setup);
+and `mobile-api-secrets-sync` stands in for the cluster secrets integration
+the design assumes, copying `/mobile-api/staging/runtime` into the namespace.
+
+### HTTPS
+
+Pass three context values and the deploy project publishes the ALB under a
+hostname of yours:
+
+```sh
+npx aws-cdk@2.1146.1 deploy MobileApiEks \
+  -c domainName=mobile-api-staging.digitaldevops.io \
+  -c hostedZoneId=Z3OKT7D3Q3TASV \
+  -c certificateArn=arn:aws:acm:us-east-1:882384879235:certificate/411f9b4a-bc8f-4342-b7e6-52f39251fa3a
+```
+
+This account already has an issued wildcard certificate for
+`*.digitaldevops.io` (expires 2027-03-13) and the public zone
+`digitaldevops.io`. A wildcard covers exactly one label, so
+`mobile-api-staging.digitaldevops.io` works and `api.staging.digitaldevops.io`
+would not. Without `certificateArn`, the stack requests a certificate for
+`domainName` with DNS validation in that zone (a few minutes). Without
+`domainName` and `hostedZoneId`, no Ingress is created and the deploy project
+runs its HTTP checks from a short-lived Job inside the cluster; the
+alternatives are a domain you own, or a self-signed certificate imported into
+ACM, which browsers and the smoke test will reject.
+
+### Order
+
+1. `npx aws-cdk@2.1146.1 deploy MobileApiEks …` (about 15 minutes). It needs
+   `MobileApiFoundation` and `MobileApiDatabase`, and an available GitHub
+   connection for the two CodeBuild projects.
+2. One-time bootstrap, as the cluster admin, from the repository root:
+
+   ```sh
+   aws eks update-kubeconfig --name mobile-api-staging --region us-east-1
+   kubectl get nodepools                       # confirms Auto Mode and your access
+   kubectl apply -f platform/eks/namespace.yaml
+   kubectl apply -f platform/eks/ingressclass.yaml
+   kubectl apply -f platform/eks/secrets-sync-rbac.yaml
+   kubectl apply -f platform/deploy-rbac.yaml
+   ```
+
+3. After the operator has stored `/mobile-api/staging/runtime` and
+   `mobile-api-db-admin` has created the database role:
+
+   ```sh
+   aws codebuild start-build --project-name mobile-api-secrets-sync
+   aws codebuild start-build --project-name mobile-api-deploy-staging \
+     --environment-variables-override name=IMAGE_TAG,value=<commit sha pushed by mobile-api-build>
+   ```
+
+   The deploy build runs the migration hook and the Helm release, checks the
+   rollout and the image digest on every API pod, smoke-tests
+   `https://<domainName>`, writes and reads a record through it, and runs the
+   manual batch Job from `docs/verification.md`. After a secret change, rerun
+   secrets-sync with `name=RESTART,value=true`.
+
+To let an existing EKS cluster reach the database instead, pass
+`-c eksWorkloadSecurityGroupId=…` to `MobileApiDatabase`.
+
 ## Cost (approximate, us-east-1)
 
 | Resource | Rate |
 | --- | --- |
+| EKS control plane | $0.10 per hour, about $73 per month |
+| Auto Mode nodes | EC2 price plus an Auto Mode fee of roughly 12%; the chart's requests fit one or two small instances, about $0.10–0.20 per hour while pods run |
+| ALB (with HTTPS) | about $0.0225 per hour plus capacity units, roughly $17–20 per month |
 | NAT gateway | about $0.045 per hour plus data, roughly $33 per month |
 | RDS db.t4g.micro + 20 GiB gp3 | about $0.016 per hour plus $2.30 per month storage, roughly $14 per month |
 | CodeBuild | per build minute while running; nothing when idle |
 | ECR, Secrets Manager, logs | cents per month at this scale |
+
+With the cluster running, expect about $0.35–0.45 per hour in total.
 
 ## Remove
 
@@ -80,7 +163,10 @@ npx aws-cdk@2.1146.1 deploy MobileApiDatabase -c eksWorkloadSecurityGroupId=sg-0
 npx aws-cdk@2.1146.1 destroy --all
 ```
 
-The ECR repository is retained (delete it by hand after removing its images),
-the RDS instance is replaced by a final snapshot, and the master secret is
-deleted with the instance. The connection and the GitHub App installation are
-removed separately.
+Before destroying `MobileApiEks`, delete the Helm release
+(`HELM_DRIVER=configmap helm uninstall mobile-api -n mobile-api-staging`) so
+Auto Mode removes the ALB, and delete the Route53 record the deploy project
+created. The ECR repository is retained (delete it by hand after removing its
+images), the RDS instance is replaced by a final snapshot, and the master
+secret is deleted with the instance. The connection and the GitHub App
+installation are removed separately.
