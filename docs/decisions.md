@@ -37,9 +37,10 @@ monitoring are designed in [operations.md](operations.md).
   [infra/](../infra/README.md) for this exercise only, to reproduce the
   external database dependency. The employer's database is managed elsewhere;
   provisioning and tuning are out of scope.
-- It is reachable privately only. Port 5432 is open to the workloads of the
-  EKS Auto Mode cluster being provisioned in the same VPC and to the
-  integration runner.
+- It is reachable privately only. Port 5432 is open to the cluster security
+  group of the staging EKS cluster in the same VPC and to the integration
+  runner. Verified: the pods, the migration hook, the batch Job, and the
+  integration runner all connect with `sslmode=verify-full`.
 - The application connects as a dedicated role, `mobile_api_app`, never as the
   master user. The master credentials exist only in Secrets Manager and are
   used once, by the db-admin runner, to create the role.
@@ -51,10 +52,13 @@ monitoring are designed in [operations.md](operations.md).
 - The employer's EKS cluster exists and runs Kubernetes 1.30 or later.
   `Chart.yaml` enforces this through `kubeVersion`, because the chart uses the
   native `preStop` sleep action. For this exercise, [infra/](../infra/README.md)
-  is provisioning an EKS Auto Mode cluster, `mobile-api-staging`, in the RDS
-  VPC (in progress).
+  provisioned an EKS 1.37 Auto Mode cluster, `mobile-api-staging`, in the RDS
+  VPC; the demo runs on it.
 - metrics-server (the resource metrics API) is installed. Without it, the HPA
-  cannot read CPU utilization and does not scale.
+  cannot read CPU utilization and does not scale. EKS Auto Mode does not
+  include it: the staging HPA reported `cpu: <unknown>` until the EKS stack
+  added the managed `metrics-server` add-on. The employer's cluster must
+  provide it too.
 - A cluster secrets integration already exists. It creates the namespaced
   Kubernetes Secret `mobile-api-runtime` from AWS Secrets Manager before the
   first install (section "Secrets" below). For this exercise, the
@@ -245,9 +249,10 @@ real batch job is idempotent; that must be shown with its own output.
   database.
 - Secret values never appear in values files, rendered manifests, test
   fixtures, logs, or the image. A Secret's name is not a credential.
-- Operators upload values with `scripts/load_secrets.py` from a trusted local
-  terminal. Values never pass through CI or an AI agent. The full flow,
-  including creating the database role, is in
+- Operators upload values from their own machine, never through CI or an AI
+  agent: with `scripts/load_secrets.py` by design, or, as the operator chose
+  for staging, with the AWS CLI reading a local file that was then deleted.
+  The full flow, including creating the database role, is in
   [operations.md](operations.md#application-secrets).
 
 ### Container security
@@ -308,8 +313,10 @@ this sleep need to be tuned together.
   HTTP listener exists only to redirect to HTTPS.
 - The payment-provider webhook route will share this ALB; signature
   verification belongs in the application.
-- Untested on a cluster. The ALB's deregistration delay and the preStop sleep
-  must be tuned together once it exists.
+- Exercised on staging: EKS Auto Mode created the ALB from the Ingress, the
+  account's `*.digitaldevops.io` certificate terminates TLS, and the deploy
+  build publishes the ALB hostname as a Route53 CNAME. The ALB's deregistration
+  delay and the preStop sleep still need tuning together.
 
 ### Rollout, selectors, image reference
 
@@ -326,15 +333,16 @@ this sleep need to be tuned together.
 
 ## Remaining assignment work
 
-- **Ingress on a cluster**: the template exists but has not been exercised;
-  the host, certificate, and deregistration tuning come with the first deploy.
+- **Ingress tuning**: the ALB's deregistration delay and the preStop sleep,
+  once the real service's request durations are known.
 - **Topology placement**: topology spread across Availability Zones and nodes.
+  Staging currently runs both API pods on one Auto Mode node.
 - **Production database**: only the staging instance exists. The production
-  connection budget, pooler decision, and the EKS workload security-group
-  rule depend on the cluster and the real service.
+  connection budget, pooler decision, and the employer cluster's security-group
+  rule depend on that cluster and the real service.
 - **Delivery and monitoring**: designed in [operations.md](operations.md).
-  The build path and the staging database are provisioned; the pipeline,
-  deploy projects, and alarms are not.
+  The build path, the staging database, the staging cluster, and the staging
+  deploy project are provisioned; the pipeline, production, and alarms are not.
 
 Also not addressed yet: pinning the base image by digest, NetworkPolicy, and
 multi-arch builds.

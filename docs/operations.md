@@ -1,15 +1,17 @@
 # Delivery and operations proposal
 
-**Status: mostly proposal.** Provisioned by [infra/](../infra/README.md) (CDK):
-the ECR repository, the CodeConnections connection, the validate and build
-CodeBuild projects, the staging VPC with its RDS PostgreSQL instance, and the
-two VPC-connected runner projects (db-admin and integration). In progress, and
-subject to change: an EKS Auto Mode cluster `mobile-api-staging` in the same
-VPC, a `mobile-api-deploy-staging` project that runs Helm, and a
-`mobile-api-secrets-sync` project that writes the Kubernetes Secret from
-Secrets Manager. Nothing else in this document exists: no CodePipeline,
-production deploy project, VPC endpoint, dashboard, or alarm. The table at the
-end separates implemented, provisioned, and proposed.
+**Status: staging exists; the rest is proposal.** Provisioned by
+[infra/](../infra/README.md) (CDK) and in use since 2026-10-29: the ECR
+repository, the CodeConnections connection, the validate and build CodeBuild
+projects, the staging VPC with its RDS PostgreSQL instance, the two
+VPC-connected runner projects (db-admin and integration), an EKS 1.37 Auto Mode
+cluster `mobile-api-staging` in the same VPC with the `metrics-server` add-on,
+the `mobile-api-secrets-sync` project that writes the Kubernetes Secret from
+Secrets Manager, and the `mobile-api-deploy-staging` project that runs Helm and
+the staging checks. The demo is deployed there and answers at
+`https://mobile-api-staging.digitaldevops.io`. Nothing else in this document
+exists: no CodePipeline, production deploy project, VPC endpoint, dashboard, or
+alarm. The table at the end separates implemented, provisioned, and proposed.
 
 GitHub hosts the source code and is how the repository is shared. Everything
 that builds, checks, or deploys runs in AWS. No GitHub Actions workflows and
@@ -104,10 +106,19 @@ Required for the real application, specified in
 - an unhealthy replacement that never becomes ready;
 - a database outage: readiness fails, liveness holds, recovery is automatic.
 
-Only the smoke test and `tests/integration` exist as code today. The rollout
-and batch commands are proposed, and none has run against a cluster. The
-integration tests run against RDS from the `mobile-api-integration` runner
-(section 3), not from a cluster.
+The `mobile-api-deploy-staging` project implements the rollout, behaviour, and
+batch checks ([buildspecs/deploy-staging.yml](../buildspecs/deploy-staging.yml))
+and ran them on 2026-10-29 against the staging cluster: Helm revision 1 with
+image `sha256:dd89cf3d…`, the HTTPS smoke test, a write and a read, and the
+manual batch Job on the same digest. Helm revision 2 then rolled the API over to
+`sha256:5b2e6b47…`, and a record written before it was read after it. Helm
+revision 3 (the same image, deploy build `f0526314`) ran the second manual Job
+for the same business date: `GET /demo/batch-runs/2026-10-29` then showed one
+row with `run_count` 2, the documented replay behaviour, against RDS. It shows
+the demo's upsert only, not the real job's idempotency. One correction along
+the way: the build's digest check at first counted a terminating old pod and
+failed after a successful rollout; it now counts only Running, non-terminating
+pods.
 
 ### Why QUEUED execution, and why stages are grouped this way
 
@@ -141,14 +152,16 @@ long-lived access keys exist, and none are stored in GitHub.
 | Role | Used by | Allows | Does not allow |
 | --- | --- | --- | --- |
 | Build | build-and-validate, image gate, package | Granted today (infra/): ECR push, pull and `ecr:DescribeImages` on the `mobile-api` repository only (plus `ecr:GetAuthorizationToken`); its own CloudWatch log group; CodeBuild reports; reading the CodeConnections connection. Proposed with the pipeline: `ecr:DescribeImageScanFindings`, the artifact bucket and its KMS key | Any `eks:*` action. It has no EKS access entry, so it cannot authenticate to any cluster. |
-| Staging deploy | deploy-staging, verify-staging | `eks:DescribeCluster` on the staging cluster; read artifacts and write verification reports in S3; KMS decrypt; its log group; VPC network-interface permissions | ECR push; production cluster or namespace |
+| Staging deploy (`mobile-api-deploy-staging`) | deploy-staging, verify-staging | Granted today (infra/): `eks:DescribeCluster` on the staging cluster, `ecr:DescribeImages` on the repository (to resolve a tag to its digest), Route53 record changes in the one hosted zone, its log group, reading the connection. Proposed with the pipeline: artifacts and verification reports in S3, KMS decrypt. It runs outside the VPC because the staging endpoint is public and private (section 3). | ECR push; Secrets Manager; production cluster or namespace |
+| Secrets sync (`mobile-api-secrets-sync`) | writes Kubernetes Secret `mobile-api-runtime`; optional restart of the Deployment | `eks:DescribeCluster`; `GetSecretValue` on `/mobile-api/staging/runtime`; its log group | ECR; the master secret; anything in Kubernetes beyond the one Secret and the one Deployment |
 | Production deploy | image re-check, deploy-production, verify-production | The same as staging deploy, but for production, plus `ecr:DescribeImageScanFindings` and `cloudwatch:DescribeAlarms` | ECR push; staging |
 | Validation | pull-request validation project | Its log group and report group | Everything else |
 | DB admin (`mobile-api-db-admin`) | one-off creation of the application role in RDS | Read `/mobile-api/staging/rds-master` and the whole `/mobile-api/staging/runtime` secret (IAM cannot scope to a JSON key; the buildspec selects `DATABASE_URL`); VPC network interfaces; its log group | ECR, EKS, S3 |
 | Integration (`mobile-api-integration`) | `python -m app.migrate` and `tests/integration` against RDS | Read the whole `/mobile-api/staging/runtime` secret (the buildspec selects `DATABASE_URL`); VPC network interfaces; its log group and report group | The master secret; ECR push; EKS |
 
-The build, validation, db-admin, and integration roles are provisioned by
-[infra/](../infra/README.md) (CDK). The two deploy roles are proposed.
+The build, validation, db-admin, integration, staging deploy, and secrets-sync
+roles are provisioned by [infra/](../infra/README.md) (CDK). The production
+deploy role is proposed.
 
 Each role trusts `codebuild.amazonaws.com` with an `aws:SourceArn` condition
 naming its own project. The staging project therefore cannot use the
@@ -158,12 +171,15 @@ notifications.
 
 **Kubernetes authorization** uses EKS access entries mapped to Kubernetes
 RBAC. The cluster's authentication mode must be `API` or
-`API_AND_CONFIG_MAP`, which is an assumption. Each deploy role gets a standard
-access entry with `kubernetesGroups` set to its environment's group:
+`API_AND_CONFIG_MAP`; the staging cluster uses `API` and no identity gets
+implicit access. Each deploy role gets a standard access entry with
+`kubernetesGroups` set to its environment's group:
 `mobile-api-staging-deployers` or `mobile-api-production-deployers`. No EKS
 access policy is associated, so
 [`platform/deploy-rbac.yaml`](../platform/deploy-rbac.yaml) is the role's only
-Kubernetes permission.
+Kubernetes permission. On staging the bootstrap applied it once, together with
+`platform/eks/`, and an impersonation check confirmed the deployer group can
+manage the chart's kinds and Jobs but not Secrets or the namespace.
 
 That file holds one `ClusterRole`, which grants nothing by itself. It is bound
 by a `RoleBinding` in each environment's namespace, so each group can act only
@@ -238,8 +254,14 @@ workload. These are separate steps with separate owners.
    - **Limits:** values exist in the process's memory while being sent. A
      compromised workstation or a recorded terminal session can still expose
      them.
+   - **How staging was loaded:** the operator used the AWS CLI instead,
+     `aws secretsmanager create-secret --secret-string file://<local file>`
+     from their own machine, and deleted the file afterwards. The boundary
+     held: the values never reached Git, CI, or the agent. The loader stays
+     the designed path because it writes nothing to disk.
 2. **Create the database role, once (`mobile-api-db-admin`, provisioned).**
-   An operator starts this CodeBuild project after step 1. Inside the VPC it
+   An operator starts this CodeBuild project after step 1; for staging it ran
+   on 2026-10-29. Inside the VPC it
    connects as the RDS master user and runs
    `platform/db/create_app_user.sql`, which creates `mobile_api_app` with the
    password from the secret loaded in step 1 and grants it `CREATE` on schema
@@ -257,9 +279,9 @@ workload. These are separate steps with separate owners.
    - **If the integration differs** (for example the Secrets Store CSI driver),
      only `runtimeSecret.name` and the restart behaviour below change.
    - **This exercise's stand-in:** the `mobile-api-secrets-sync` CodeBuild
-     project (infra/, in progress) reads `/mobile-api/staging/runtime` and
-     writes Secret `mobile-api-runtime` in the staging namespace. It does not
-     refresh on its own; run it again after the secret changes.
+     project (infra/, provisioned and run) reads `/mobile-api/staging/runtime`
+     and writes Secret `mobile-api-runtime` in the staging namespace. It does
+     not refresh on its own; run it again after the secret changes.
 4. **Consume, through the chart.**
    - **How:** with `runtimeSecret.name: mobile-api-runtime` (the default), the
      API container reads both keys as environment variables through
@@ -287,17 +309,22 @@ workload. These are separate steps with separate owners.
   readiness fails until the rollout restart completes. The webhook-secret
   rotation procedure depends on the payment-provider contract (section 7).
 
-None of the pipeline or deploy roles can read application secrets: they have
+Neither the build nor the deploy roles can read application secrets: they have
 no `GetSecretValue`, and the deployer role has no Kubernetes Secrets access.
-The two VPC runner roles are the deliberate exception: db-admin reads the
-master secret and `DATABASE_URL` once to create the role, and the integration
-runner reads `DATABASE_URL`.
+Three roles are the deliberate exceptions: db-admin reads the master secret and
+`DATABASE_URL` once to create the role, the integration runner reads
+`DATABASE_URL`, and secrets-sync reads the runtime secret to write the one
+Kubernetes Secret.
 
 ## 3. Networking for a private EKS API endpoint
 
-Image building stays in the build project. That is the only project with
-privileged mode, because Docker needs it, and it needs no cluster access. The
-deploy projects are unprivileged, have no Docker, and run in the VPC:
+This section is the proposed production setup. The staging cluster takes a
+simplification: its API endpoint is public as well as private, so
+`mobile-api-deploy-staging` and `mobile-api-secrets-sync` run outside the VPC
+and authenticate with IAM only. Image building stays in the build project. That
+is the only project with privileged mode, because Docker needs it, and it needs
+no cluster access. With a private endpoint, the deploy projects are
+unprivileged, have no Docker, and run in the VPC:
 
 - **Subnets:** private subnets in the cluster VPC. A peered or Transit Gateway
   VPC also works, but needs the DNS step below.
@@ -334,7 +361,7 @@ database for this exercise. Database tuning is out of scope.
 | --- | --- |
 | Network | VPC `mobile-api`, private subnets, one NAT gateway for the runners' outbound access (PyPI, GitHub, ECR, Secrets Manager) |
 | Instance | RDS for PostgreSQL 17 `mobile-api-staging`, `db.t4g.micro`, storage encrypted, not publicly accessible, database `mobileapi` |
-| Inbound | TCP 5432 only from the integration-runner security group and from the workloads of the EKS Auto Mode cluster `mobile-api-staging` being provisioned in the same VPC. Nothing else, including the build project, can reach it. |
+| Inbound | TCP 5432 only from the integration-runner security group and from the cluster security group of the EKS Auto Mode cluster `mobile-api-staging` in the same VPC (rule created by the EKS stack). Nothing else, including the build project, can reach it. |
 | TLS | Server certificate from RDS CA `rds-ca-rsa2048-g1`. Clients use `sslmode=verify-full`, verifying certificate and hostname against the RDS global bundle baked into the image. |
 | Master user | `postgres_admin`; credentials generated by RDS into Secrets Manager `/mobile-api/staging/rds-master`. Used only by the one-off `mobile-api-db-admin` runner, never by the application, the pipeline, or in this conversation. |
 | Application role | `mobile_api_app`, created by `platform/db/create_app_user.sql` with the password the operator loaded into `/mobile-api/staging/runtime`. Owns the application's schema objects and has `CREATE` on schema `public`, so migrations run as this role. |
@@ -343,8 +370,9 @@ How things reach it:
 
 - **Application pods** connect from the EKS cluster over the VPC: the cluster
   shares this VPC, the endpoint's private DNS name resolves from it, and the
-  pods' security group is the one allowed in. The cluster is still being
-  provisioned, so this path is untested.
+  pods carry the cluster security group that is allowed in. Verified on
+  2026-10-29: readiness 200, writes and reads through the API, the migration
+  hook, and the batch Job, all against RDS with `sslmode=verify-full`.
 - **Integration runner** (`mobile-api-integration`) runs in the private subnets
   with the allowed security group. CodeBuild injects `DATABASE_URL` from
   Secrets Manager at build start; the runner applies the migrations, then runs
@@ -501,7 +529,7 @@ period set.
 
 | Signal | Source | State |
 | --- | --- | --- |
-| Request count, target and load-balancer 5xx, target response time, healthy and unhealthy hosts | ALB metrics | Available once the ALB exists; no app change |
+| Request count, target and load-balancer 5xx, target response time, healthy and unhealthy hosts | ALB metrics | Available now for staging, where the ALB exists; no app change |
 | Pod CPU and memory against requests, restarts, running pods | Container Insights (Observability add-on) | Available once the add-on is installed |
 | Database: connections, CPU, free storage and memory, read and write latency | RDS CloudWatch metrics (`DatabaseConnections`, `CPUUtilization`, `FreeStorageSpace`, `FreeableMemory`, `ReadLatency`, `WriteLatency`) | Available now for the staging instance; no app change. There is no read replica, so no replica-lag metric. |
 | Per-operation latency, errors, and faults; SLOs | CloudWatch Application Signals: OpenTelemetry auto-instrumentation from the add-on, enabled by the pod annotation `instrumentation.opentelemetry.io/inject-python: "true"` | Supports Python 3.10–3.14. The single Uvicorn worker avoids the documented pre-fork caveat. |
@@ -578,7 +606,8 @@ data point counts as breaching; missing 5xx data does not.
     fit, and the production instance class is unknown;
   - whether a pooler or RDS Proxy is needed;
   - the production database, which is not provisioned.
-- **EKS workload security group**, for the RDS inbound rule.
+- **EKS workload security group** of the employer's cluster, for the RDS
+  inbound rule (staging uses its own cluster's group).
 - **Batch contract.**
   - production schedule and time zone;
   - business-date semantics (the demo defaults to the current UTC date);
@@ -587,11 +616,12 @@ data point counts as breaching; missing 5xx data does not.
   - which key identifies a business period for safe replay.
 - **Image-gate policy for unfixable base-image CVEs** (section 4).
 - **Operational destination.** Where SNS delivers, and who is on call.
-- **Platform:**
+- **Platform** (for the employer's cluster; staging answers each for itself):
   - one cluster with two namespaces, or separate clusters;
-  - EKS endpoint access: private or public;
+  - EKS endpoint access: private or public (staging: both);
   - whether NAT is available;
-  - whether the cluster's authentication mode supports access entries.
+  - whether the cluster's authentication mode supports access entries
+    (staging: `API`).
 - **Dependency scanning.** Whether Inspector Code Security reads
   `requirements.txt`.
 
@@ -599,12 +629,12 @@ data point counts as breaching; missing 5xx data does not.
 
 | Item | State |
 | --- | --- |
-| Chart (API, HPA, PDB, CronJob, migration hook Job, Ingress off by default, secret references) and environment values | Implemented. Linted, rendered, schema-validated, and relationship-checked. Not installed on a cluster. |
-| EKS Auto Mode cluster `mobile-api-staging`, `mobile-api-deploy-staging`, `mobile-api-secrets-sync` | Being provisioned by infra/ (CDK); in progress. Nothing deployed to it yet. |
-| Demo application (PostgreSQL persistence, migration, batch replay) and container image | Implemented. Unit-tested, built, and checked locally with Podman against a PostgreSQL 17 container. |
-| Chart, app, integration, and secrets-loader tests; container check; smoke test; secret scan; buildspecs | Implemented and run locally. |
-| ECR repository, CodeConnections connection, CodeBuild validate and build projects | Provisioned by infra/ (CDK). `mobile-api-validate` has run on a pull request through the GitHub App webhook; `mobile-api-build` has built, checked, and pushed an image tagged by commit SHA. |
-| Staging VPC, RDS PostgreSQL 17 instance, db-admin and integration runners | Provisioned by infra/ (CDK). Integration tests against RDS pending the operator steps. |
-| Secrets loader (`scripts/load_secrets.py`) | Implemented. Offline tests only. Never run against AWS by the agent. |
-| Deployer RBAC (`platform/deploy-rbac.yaml`) | Written, schema-validated, and checked against the rendered chart. Not applied to any cluster. |
-| Everything else in this document | Proposed only |
+| Chart (API, HPA, PDB, CronJob, migration hook Job, Ingress, secret references) and environment values | Implemented. Linted, rendered, schema-validated, relationship-checked, and installed on the staging cluster (Helm release `mobile-api`, revisions 1 to 3, 2026-10-29). |
+| EKS 1.37 Auto Mode cluster `mobile-api-staging`, `metrics-server` add-on, `mobile-api-secrets-sync`, `mobile-api-deploy-staging`, HTTPS Ingress through an ALB at `mobile-api-staging.digitaldevops.io` | Provisioned by infra/ (CDK) and used: Secret synced, three deploys, two manual batch Jobs (replay shown), HPA reading CPU. Endpoint public and private (a simplification). |
+| Demo application (PostgreSQL persistence, migration, batch replay) and container image | Implemented. Unit-tested; built, checked (26/26), and pushed by `mobile-api-build` for commits `73de0a8` and `61fb83d`; running on staging against RDS. |
+| Chart, app, integration, and secrets-loader tests; container check; smoke test; secret scan; buildspecs | Implemented. Run locally and in CodeBuild; the integration tests ran against RDS; the smoke test ran against the staging hostname. |
+| ECR repository, CodeConnections connection, CodeBuild validate and build projects | Provisioned by infra/ (CDK). `mobile-api-validate` runs on pull requests through the GitHub App webhook; `mobile-api-build` has pushed two images tagged by commit SHA. ECR basic scanning is on (enhanced scanning is not enabled for the account). |
+| Staging VPC, RDS PostgreSQL 17 instance, db-admin and integration runners | Provisioned by infra/ (CDK) and run: application role created, schema applied, 6 integration tests passed over TLS. |
+| Secrets loader (`scripts/load_secrets.py`) | Implemented. Offline tests only. The operator stored the staging secret with the AWS CLI instead; the agent never ran the loader or saw a value. |
+| Deployer RBAC (`platform/deploy-rbac.yaml`) and the bootstrap manifests in `platform/eks/` | Applied once to the staging cluster (the staging binding only); checked by impersonation. |
+| Everything else in this document: CodePipeline, production, image gate, Inspector, monitoring, alarms, private-endpoint networking | Proposed only |

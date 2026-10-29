@@ -3,17 +3,18 @@
 A CDK app (Python) that provisions the AWS side of this exercise in account
 `882384879235`, region `us-east-1`. It covers the build path, the database that
 stands in for the external PostgreSQL dependency, and a staging EKS cluster with
-the projects that deploy to it. It does **not** create the release pipeline,
+the projects that deploy to it. All five stacks are deployed, and the demo runs
+on the cluster (2026-10-29). It does **not** create the release pipeline,
 production, or monitoring; those remain proposals in
 [docs/operations.md](../docs/operations.md).
 
 | Stack | Creates | Why |
 | --- | --- | --- |
 | `MobileApiFoundation` | ECR repository `mobile-api` (immutable tags, scan on push, last 30 images kept, retained on delete). CodeConnections connection `fastapi-eks-takehome` to GitHub. | Where images live; how CodeBuild reads the repository. |
-| `MobileApiDatabase` | VPC `mobile-api` (10.60.0.0/16, two AZs, one NAT gateway; public, `runners`, and isolated `database` subnets). RDS PostgreSQL 17.11 `mobile-api-staging`, db.t4g.micro, 20 GiB gp3, encrypted, not public, TLS required (`rds.force_ssl`), CA `rds-ca-rsa2048-g1`, master credentials generated into secret `/mobile-api/staging/rds-master`. Security group opening 5432 only to the runners (and to an EKS workload security group when given as context). | Reproduces the external database with private connectivity. |
+| `MobileApiDatabase` | VPC `mobile-api` (10.60.0.0/16, two AZs, one NAT gateway; public, `runners`, and isolated `database` subnets). RDS PostgreSQL 17.11 `mobile-api-staging`, db.t4g.micro, 20 GiB gp3, encrypted, not public, TLS required (`rds.force_ssl`), CA `rds-ca-rsa2048-g1`, master credentials generated into secret `/mobile-api/staging/rds-master`. Security group opening 5432 only to the runners, to the staging cluster's security group (rule added by `MobileApiEks`), and to an external EKS workload security group when given as context. | Reproduces the external database with private connectivity. |
 | `MobileApiBuild` | CodeBuild `mobile-api-validate` (pull requests, `buildspecs/validate.yml`) and `mobile-api-build` (pushes to `main`, `buildspecs/build.yml`, privileged for Docker, pushes images by commit SHA). | Verification and image delivery. |
 | `MobileApiIntegration` | CodeBuild `mobile-api-db-admin` (one-off: creates the application role) and `mobile-api-integration` (migrations and integration tests against RDS). Both run in the `runners` subnets, started by hand. | The only paths into the private database. |
-| `MobileApiEks` | EKS Auto Mode cluster `mobile-api-staging` (Kubernetes 1.37, `system` and `general-purpose` node pools, built-in load balancing and block storage, API and audit logs). Access entries for the cluster admin, the deploy role and the secrets-sync role. The database security group opens 5432 to the cluster security group. CodeBuild `mobile-api-secrets-sync` and `mobile-api-deploy-staging`. Optionally an ACM certificate and Route53 permissions. | The staging cluster the chart deploys to; see the section below. |
+| `MobileApiEks` | EKS Auto Mode cluster `mobile-api-staging` (Kubernetes 1.37, `system` and `general-purpose` node pools, built-in load balancing and block storage, API and audit logs). The managed `metrics-server` add-on (v0.9.0-eksbuild.14; Auto Mode does not include it, and the HPA cannot read CPU without it). Access entries for the cluster admin, the deploy role and the secrets-sync role. The database security group opens 5432 to the cluster security group. CodeBuild `mobile-api-secrets-sync` and `mobile-api-deploy-staging`. Route53 permissions for the HTTPS hostname, and an ACM certificate when none is given. | The staging cluster the chart deploys to; see the section below. |
 
 Every CodeBuild role is limited to its job: the build role can push to the one
 ECR repository and nothing else; the integration role can read only the
@@ -50,7 +51,8 @@ connection is pending.
 npx aws-cdk@2.1146.1 deploy MobileApiBuild MobileApiIntegration
 ```
 
-To allow EKS workloads to reach the database once the cluster exists:
+`MobileApiEks` adds its own cluster's rule. To let a different EKS cluster
+reach the database:
 
 ```sh
 npx aws-cdk@2.1146.1 deploy MobileApiDatabase -c eksWorkloadSecurityGroupId=sg-0123456789abcdef0
@@ -63,11 +65,19 @@ npx aws-cdk@2.1146.1 deploy MobileApiDatabase -c eksWorkloadSecurityGroupId=sg-0
    `python scripts/load_secrets.py --profile <profile> --region us-east-1 --expected-account-id 882384879235 --secret-name /mobile-api/staging/runtime`.
    `DATABASE_URL` must be
    `postgresql://mobile_api_app:<password>@<DatabaseEndpoint>:5432/mobileapi?sslmode=verify-full`.
-2. Create the role in the database: `aws codebuild start-build --project-name mobile-api-db-admin`.
+   For staging the operator used the AWS CLI instead
+   (`aws secretsmanager create-secret --name /mobile-api/staging/runtime --secret-string file://<local file>`)
+   and deleted the file; the values never reached Git or the agent.
+2. Create the role in the database: `aws codebuild start-build --project-name mobile-api-db-admin --source-version <commit>`.
    It reads both secrets inside the VPC and runs `platform/db/create_app_user.sql`.
-   Repeat it after changing the password in the secret.
+   Repeat it after changing the password in the secret. Ran for staging on
+   2026-10-29.
 3. Run the schema and the integration tests:
-   `aws codebuild start-build --project-name mobile-api-integration`.
+   `aws codebuild start-build --project-name mobile-api-integration --source-version <commit>`.
+   Ran for staging on 2026-10-29: `0001_initial` applied, 6 tests passed.
+
+`--source-version` matters until the branch is merged: without it, every
+project builds the repository's default branch.
 
 ## EKS cluster and staging deployment
 
@@ -91,8 +101,9 @@ the design assumes, copying `/mobile-api/staging/runtime` into the namespace.
 
 ### HTTPS
 
-Pass three context values and the deploy project publishes the ALB under a
-hostname of yours:
+Three context values make the deploy project publish the ALB under a hostname
+of yours. For staging they are committed in `infra/cdk.json`, so a plain
+`deploy` uses them; `-c` flags override them:
 
 ```sh
 npx aws-cdk@2.1146.1 deploy MobileApiEks \
@@ -138,10 +149,16 @@ ACM, which browsers and the smoke test will reject.
    ```
 
    The deploy build runs the migration hook and the Helm release, checks the
-   rollout and the image digest on every API pod, smoke-tests
-   `https://<domainName>`, writes and reads a record through it, and runs the
-   manual batch Job from `docs/verification.md`. After a secret change, rerun
-   secrets-sync with `name=RESTART,value=true`.
+   rollout and the image digest on every Running API pod (terminating pods of
+   the previous ReplicaSet are skipped; the first version counted one and
+   failed after a successful rollout), smoke-tests `https://<domainName>`,
+   writes and reads a record through it, and runs the manual batch Job from
+   `docs/verification.md`. After a secret change, rerun secrets-sync with
+   `name=RESTART,value=true`.
+
+   All of this ran for staging on 2026-10-29: the bootstrap, secrets-sync, and
+   three deploys (image `73de0a8`, then `61fb83d` twice; Helm revision 3). The projects build the
+   repository's default branch unless `--source-version <commit>` is given.
 
 To let an existing EKS cluster reach the database instead, pass
 `-c eksWorkloadSecurityGroupId=…` to `MobileApiDatabase`.

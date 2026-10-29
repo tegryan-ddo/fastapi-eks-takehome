@@ -37,11 +37,11 @@ dependency; it does not run PostgreSQL inside Kubernetes.
 | --- | --- |
 | Demo application: HTTP API with PostgreSQL persistence, migration command, batch command | Done; unit-tested, and checked locally against a PostgreSQL 17 container |
 | Container image | Built, checked, and pushed to ECR by the `mobile-api-build` CodeBuild project (tag = commit SHA); also checked locally with Podman |
-| Chart: Deployment, Service, ServiceAccount, HPA, PDB, CronJob, migration hook Job, secret references | Linted, rendered, schema-validated, and relationship-checked; **not installed on a cluster** |
-| Staging database: VPC, RDS PostgreSQL 17, VPC-connected db-admin and integration runners | Provisioned by [infra/](infra/README.md) (CDK); **integration tests against RDS pending the operator steps below** |
-| Build path: ECR repository, CodeConnections, CodeBuild validate and build projects | Provisioned by [infra/](infra/README.md) (CDK). `mobile-api-validate` runs on pull requests through the GitHub App webhook; `mobile-api-build` has pushed an image |
-| Staging cluster: EKS Auto Mode `mobile-api-staging` in the RDS VPC, `mobile-api-deploy-staging` (runs Helm), `mobile-api-secrets-sync` (writes the Kubernetes Secret `mobile-api-runtime` from Secrets Manager) | Being provisioned by [infra/](infra/README.md) (CDK); in progress, nothing deployed to it yet |
-| Ingress (ALB) | In the chart, off by default; the host and ACM certificate are supplied at deploy time; **not tested on a cluster** |
+| Chart: Deployment, Service, ServiceAccount, HPA, PDB, CronJob, migration hook Job, Ingress, secret references | Linted, rendered, schema-validated, relationship-checked, and installed on the staging cluster by `mobile-api-deploy-staging` (Helm release `mobile-api`, three revisions on 2026-10-29: one install, two upgrades) |
+| Staging database: VPC, RDS PostgreSQL 17, VPC-connected db-admin and integration runners | Provisioned by [infra/](infra/README.md) (CDK). `mobile-api-db-admin` created the application role; `mobile-api-integration` applied the schema and passed the 6 integration tests against RDS over TLS |
+| Build path: ECR repository, CodeConnections, CodeBuild validate and build projects | Provisioned by [infra/](infra/README.md) (CDK). `mobile-api-validate` runs on pull requests through the GitHub App webhook; `mobile-api-build` has pushed two images tagged by commit SHA |
+| Staging cluster: EKS 1.37 Auto Mode `mobile-api-staging` in the RDS VPC with the `metrics-server` add-on, `mobile-api-secrets-sync` (writes the Kubernetes Secret `mobile-api-runtime` from Secrets Manager), `mobile-api-deploy-staging` (runs Helm and the checks) | Provisioned by [infra/](infra/README.md) (CDK). The demo runs on it and answers at `https://mobile-api-staging.digitaldevops.io`; the HPA reads CPU; the CronJob is suspended as designed |
+| Ingress (ALB, HTTPS) | Enabled in staging by the deploy build: an ALB from EKS Auto Mode, the account's `*.digitaldevops.io` ACM certificate, a Route53 CNAME. Verified from outside the cluster with certificate verification |
 | Secrets loader (`scripts/load_secrets.py`) | Included; offline tests pass with dummy values and mocked AWS clients |
 | Delivery pipeline, production deploy project, monitoring | Written proposal: [docs/operations.md](docs/operations.md) |
 | Topology spread, production database | Not started |
@@ -58,14 +58,16 @@ charts/mobile-api/            Helm application chart
 environments/staging.yaml     staging overrides (CronJob suspended)
 environments/production.yaml  production overrides (HPA range)
 examples/demo-api/            demo FastAPI app (package app/, app/migrations/) and Dockerfile
-infra/                        CDK: ECR, CodeConnections, CodeBuild, VPC, RDS, VPC runners
-platform/deploy-rbac.yaml     Kubernetes RBAC for the deploy roles (proposed, not applied)
+infra/                        CDK: ECR, CodeConnections, CodeBuild, VPC, RDS, VPC runners,
+                              EKS Auto Mode cluster, deploy and secrets-sync projects
+platform/deploy-rbac.yaml     Kubernetes RBAC for the deploy roles (applied on staging)
+platform/eks/                 one-time cluster bootstrap: namespace, IngressClass, sync RBAC
 platform/db/                  SQL run once by the db-admin runner to create the app role
 scripts/                      container check, smoke test, secret scan, secrets loader,
                               pinned tool downloads
 tests/                        chart, demo app, integration, and secrets-loader tests
-buildspecs/validate.yml       CodeBuild validation build (pull requests)
-buildspecs/build.yml          CodeBuild release build (pushes to main; pushes the image)
+buildspecs/                   CodeBuild: validate (pull requests), build (pushes to main; pushes
+                              the image), db-bootstrap, integration, secrets-sync, deploy-staging
 docs/decisions.md             assumptions and reasons for consequential choices
 docs/operations.md            delivery, secrets, RDS, and monitoring design (AWS)
 docs/verification.md          what each check catches; manual batch run; acceptance plan
@@ -177,9 +179,10 @@ helm template mobile-api charts/mobile-api -f environments/production.yaml \
 ## Set up the staging database and secrets (operator)
 
 The staging RDS instance, its VPC, and two VPC-connected CodeBuild runners are
-created by [infra/](infra/README.md). No database password ever appears in Git
-or in this conversation; the two VPC runners receive credentials from Secrets
-Manager at run time, inside the VPC. The steps, in order:
+created by [infra/](infra/README.md). No database password appears in Git or
+passes through an AI agent; the two VPC runners receive credentials from
+Secrets Manager at run time, inside the VPC. The steps, in order (all three
+were done for staging on 2026-10-29):
 
 1. **Load the application secret** from your own trusted terminal. The
    database password is one you choose for the application role; type it only
@@ -194,6 +197,12 @@ Manager at run time, inside the VPC. The steps, in order:
    # PAYMENTS_WEBHOOK_SECRET: any value for the demo
    ```
 
+   For staging, the operator chose a different route with the same boundary:
+   `aws secretsmanager create-secret --name /mobile-api/staging/runtime
+   --secret-string file://<local file>` from their own machine, then deleted
+   the file. The values never reached Git or the agent. The loader remains the
+   designed path because it writes nothing to disk.
+
 2. **Create the application role once.** Start the `mobile-api-db-admin`
    CodeBuild project. It connects as the RDS master user and runs
    `platform/db/create_app_user.sql`, creating `mobile_api_app` with the
@@ -204,7 +213,8 @@ Manager at run time, inside the VPC. The steps, in order:
 3. **Migrate and test against RDS.** Start the `mobile-api-integration`
    CodeBuild project. It runs `python -m app.migrate` and then
    `python -m pytest tests/integration` inside the VPC, with `DATABASE_URL`
-   injected from the secret.
+   injected from the secret. On staging it applied `0001_initial` and passed
+   all 6 tests with `sslmode=verify-full`.
 
 Uploading a secret and making it available to pods are separate steps. See
 [docs/operations.md](docs/operations.md#application-secrets) for the cluster
@@ -212,8 +222,10 @@ integration, the restart needed after a change, and the tool's limits.
 
 ## Deploy with your own environment values
 
-Not yet run against a cluster. Put your environment specifics in a values file
-of your own:
+This is what `mobile-api-deploy-staging` runs
+([buildspecs/deploy-staging.yml](buildspecs/deploy-staging.yml)); it has
+deployed the demo to the staging cluster three times. To deploy elsewhere, put your
+environment specifics in a values file of your own:
 
 ```yaml
 # my-staging.yaml
@@ -246,11 +258,14 @@ The cluster needs:
   migration hook reads `DATABASE_URL` from it;
 - network access from the pods to RDS on port 5432 (see
   [docs/operations.md](docs/operations.md#rds-environment));
-- metrics-server, which the HPA reads CPU metrics from;
+- metrics-server, which the HPA reads CPU metrics from. EKS Auto Mode does not
+  include it; the staging cluster gets it as a managed add-on from
+  [infra/](infra/README.md);
 - an IngressClass named `alb` with an ALB controller behind it (EKS Auto Mode
   provides the controller), if the Ingress is enabled;
 - the deployer RBAC in `platform/deploy-rbac.yaml`, if you deploy with the
-  pipeline's role.
+  pipeline's role. On staging these came from the one-time bootstrap in
+  `platform/eks/` plus that file.
 
 `HELM_DRIVER=configmap` keeps Helm's release history out of Secrets; see
 [docs/operations.md](docs/operations.md#2-permissions).
@@ -267,10 +282,10 @@ python scripts/secret_scan.py        # Git history and working tree, redacted
 
 `tests/integration` runs where `DATABASE_URL` points at a reachable database:
 locally against the container above, or in the `mobile-api-integration` runner
-against RDS. The first run downloads pinned, checksum-verified Helm,
-kubeconform, and gitleaks binaries into `.tools/`.
-[docs/verification.md](docs/verification.md) lists what each check catches and
-what still needs RDS, a cluster, or the real application.
+against RDS, where it has passed. The first run downloads pinned,
+checksum-verified Helm, kubeconform, gitleaks, and kubectl binaries into
+`.tools/`. [docs/verification.md](docs/verification.md) lists what each check
+catches, what ran on staging, and what still needs the real application.
 
 ## How Helm combines values
 
