@@ -71,8 +71,11 @@ phases:
           --set image.repository="$ECR_REPOSITORY_URI" --set image.digest="$DIGEST" \
           --rollback-on-failure --wait=watcher --timeout 10m --history-max 20
         kubectl rollout status deployment/mobile-api -n "$NAMESPACE" --timeout=5m
-        kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=api \
-          -o jsonpath='{range .items[*]}{.status.containerStatuses[0].imageID}{"\n"}{end}' | tee api-pods.txt
+        # Old pods are still terminating (preStop + graceful shutdown) after the
+        # rollout completes, and a pod waiting for a node has no image yet, so
+        # only Running pods without a deletion timestamp count.
+        kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=api --field-selector=status.phase=Running \
+          -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{(index .status.containerStatuses 0).imageID}}{{"\n"}}{{end}}{{end}}' | tee api-pods.txt
         if [ ! -s api-pods.txt ] || grep -qv "$DIGEST" api-pods.txt; then
           echo "An API pod is not running $DIGEST"; exit 1
         fi
