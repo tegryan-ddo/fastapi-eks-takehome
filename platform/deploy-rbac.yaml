@@ -1,0 +1,64 @@
+# Kubernetes permissions for the pipeline's deploy roles. Proposed; not applied.
+#
+# A cluster administrator applies this once. Each CodeBuild deploy role has an
+# EKS access entry mapping it to its environment's group, with no EKS access
+# policy associated, so these bindings are its only Kubernetes permissions.
+# The ClusterRole grants nothing by itself; each RoleBinding grants it inside
+# one namespace only. With separate clusters, apply only that cluster's binding.
+#
+# Helm runs with HELM_DRIVER=configmap, so release history is stored in
+# ConfigMaps and the deployer needs no access to Secrets.
+#
+# tests/chart/test_chart.py fails if the chart renders a kind this role cannot
+# manage, or if the role gains broad permissions.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: mobile-api-deployer
+rules:
+  # Resources the chart manages. Extend when the chart adds a kind.
+  - apiGroups: [""]
+    resources: [serviceaccounts, services]
+    verbs: [get, list, watch, create, update, patch, delete]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Helm release history.
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch, create, update, patch, delete]
+  # Waiting for the rollout and verifying it: read only.
+  - apiGroups: [apps]
+    resources: [replicasets]
+    verbs: [get, list, watch]
+  - apiGroups: [""]
+    resources: [pods, events]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mobile-api-deployer
+  namespace: mobile-api-staging
+subjects:
+  - kind: Group
+    name: mobile-api-staging-deployers
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: mobile-api-deployer
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: mobile-api-deployer
+  namespace: mobile-api-production
+subjects:
+  - kind: Group
+    name: mobile-api-production-deployers
+    apiGroup: rbac.authorization.k8s.io
+roleRef:
+  kind: ClusterRole
+  name: mobile-api-deployer
+  apiGroup: rbac.authorization.k8s.io

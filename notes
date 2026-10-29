@@ -1,0 +1,20 @@
+Requirements
+- Python/FastApi on port 8000
+- read/write access to postgres
+- webhooks from payment provider
+- runs a daily batch job
+- critical path for mobile app
+- traffic peaks around 2-3k requests/sec in the
+evenings
+- Postgres is outside the cluster
+
+questions
+- batch job on the fastapi container or separate container?
+
+Out of scope
+- tuning db
+- connection details
+
+Decisions
+- github actions are out due to billing issues
+- python downgraded to 3.13 so inspector code security works (docs list support up to 3.13)
