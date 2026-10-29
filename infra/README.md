@@ -8,6 +8,19 @@ on the cluster (2026-10-29). It does **not** create the release pipeline,
 production, or monitoring; those remain proposals in
 [docs/operations.md](../docs/operations.md).
 
+**Submission snapshot: `643dbb7`.** Validation and staging-deployment builds
+from this source succeeded. Database-bootstrap, RDS-integration, and secrets-sync
+builds succeeded from source `73de0a8`. Staging identity, liveness, and readiness
+were observed over verified HTTPS on 28 October 2026 (Pacific), with reported
+application version `0.1.0-61fb83d`. See the [submission status](../README.md)
+for exact run references and image provenance. Production, peak-load, and
+real-payment verification are outside this evidence.
+
+Historical provisioning and rollout notes in this runbook come from the build
+agent's recorded verification on 29 October 2026 UTC (28 October Pacific).
+The root README separates them from commit-status results and direct public
+HTTPS observations.
+
 | Stack | Creates | Why |
 | --- | --- | --- |
 | `MobileApiFoundation` | ECR repository `mobile-api` (immutable tags, scan on push, last 30 images kept, retained on delete). CodeConnections connection `fastapi-eks-takehome` to GitHub. | Where images live; how CodeBuild reads the repository. |
@@ -82,9 +95,10 @@ project builds the repository's default branch.
 ## EKS cluster and staging deployment
 
 `MobileApiEks` creates the staging cluster with EKS Auto Mode, so AWS runs the
-nodes, the VPC CNI, CoreDNS, EBS and the load-balancer controller; nothing is
-installed into the cluster by this repository except the manifests under
-`platform/`. Authentication mode is `API` only and the creating identity gets
+nodes, the VPC CNI, CoreDNS, EBS and the load-balancer controller. Cluster
+bootstrap applies the manifests under `platform/`; the staging deploy project
+installs the application Helm chart. Authentication mode is `API` only and
+the creating identity gets
 no implicit access: the three access entries are the whole list.
 
 | Principal | Access entry | Kubernetes permissions |

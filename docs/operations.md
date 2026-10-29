@@ -1,17 +1,21 @@
 # Delivery and operations proposal
 
-**Status: staging exists; the rest is proposal.** Provisioned by
-[infra/](../infra/README.md) (CDK) and in use since 2026-10-29: the ECR
-repository, the CodeConnections connection, the validate and build CodeBuild
-projects, the staging VPC with its RDS PostgreSQL instance, the two
-VPC-connected runner projects (db-admin and integration), an EKS 1.37 Auto Mode
-cluster `mobile-api-staging` in the same VPC with the `metrics-server` add-on,
-the `mobile-api-secrets-sync` project that writes the Kubernetes Secret from
-Secrets Manager, and the `mobile-api-deploy-staging` project that runs Helm and
-the staging checks. The demo is deployed there and answers at
-`https://mobile-api-staging.digitaldevops.io`. Nothing else in this document
-exists: no CodePipeline, production deploy project, VPC endpoint, dashboard, or
-alarm. The table at the end separates implemented, provisioned, and proposed.
+**Submission snapshot: `643dbb7`.** GitHub reports successful validation and
+staging-deployment builds from this source revision. Database bootstrap, RDS
+integration, and secrets-sync succeeded from source `73de0a8`. Public staging
+identity, liveness, and readiness were also observed over verified HTTPS on
+28 October 2026 (Pacific); the application reported version `0.1.0-61fb83d`.
+The deploy source revision and application image are separate identifiers;
+see the [submission status](../README.md) for evidence and image provenance.
+These results do not establish peak throughput, real payment behavior,
+production readiness, or completion of every acceptance scenario.
+
+The build agent's recorded verification adds the provisioning and historical
+rollout details below: all five CDK stacks, metrics-server, and the staging
+deployment path were used. These details complement the commit-status and
+public HTTPS evidence in the root README; they are not an independent replay
+of the build logs. CodePipeline, production deployment, enhanced image gates,
+application dashboards and alarms remain proposed.
 
 GitHub hosts the source code and is how the repository is shared. Everything
 that builds, checks, or deploys runs in AWS. No GitHub Actions workflows and
@@ -106,6 +110,8 @@ Required for the real application, specified in
 - an unhealthy replacement that never becomes ready;
 - a database outage: readiness fails, liveness holds, recovery is automatic.
 
+**Build agent’s recorded staging verification (29 October 2026 UTC).**
+
 The `mobile-api-deploy-staging` project implements the rollout, behaviour, and
 batch checks ([buildspecs/deploy-staging.yml](../buildspecs/deploy-staging.yml))
 and ran them on 2026-10-29 against the staging cluster: Helm revision 1 with
@@ -119,6 +125,14 @@ the demo's upsert only, not the real job's idempotency. One correction along
 the way: the build's digest check at first counted a terminating old pod and
 failed after a successful rollout; it now counts only Running, non-terminating
 pods.
+
+Separate read-only HTTPS checks observed `GET /demo/records/5` returning the
+note `staging check before rollout to 61fb83d`, and
+`GET /demo/batch-runs/2026-10-29` returning one summary with `record_count: 3`
+and `run_count: 2`. Its first and last run timestamps were
+`2026-10-29T00:48:35.933635Z` and `2026-10-29T01:00:32.624863Z`. These checks
+confirm the returned state; the historical before-and-after rollout sequence
+above is attributed to the build agent.
 
 ### Why QUEUED execution, and why stages are grouped this way
 
@@ -149,6 +163,9 @@ no deploy permissions.
 CodeBuild obtains temporary credentials for its service role automatically. No
 long-lived access keys exist, and none are stored in GitHub.
 
+The table distinguishes implemented staging permissions from proposed
+release-pipeline additions.
+
 | Role | Used by | Allows | Does not allow |
 | --- | --- | --- | --- |
 | Build | build-and-validate, image gate, package | Granted today (infra/): ECR push, pull and `ecr:DescribeImages` on the `mobile-api` repository only (plus `ecr:GetAuthorizationToken`); its own CloudWatch log group; CodeBuild reports; reading the CodeConnections connection. Proposed with the pipeline: `ecr:DescribeImageScanFindings`, the artifact bucket and its KMS key | Any `eks:*` action. It has no EKS access entry, so it cannot authenticate to any cluster. |
@@ -163,7 +180,8 @@ The build, validation, db-admin, integration, staging deploy, and secrets-sync
 roles are provisioned by [infra/](../infra/README.md) (CDK). The production
 deploy role is proposed.
 
-Each role trusts `codebuild.amazonaws.com` with an `aws:SourceArn` condition
+In the proposed release pipeline, each role trusts `codebuild.amazonaws.com`
+with an `aws:SourceArn` condition
 naming its own project. The staging project therefore cannot use the
 production role. The CodePipeline service role may start these projects, use
 the CodeConnections connection, read and write artifacts, and publish approval
@@ -389,6 +407,10 @@ in section 7.
 
 ### Image gate: ECR enhanced scanning with Amazon Inspector
 
+The build agent records ECR basic scan-on-push for staging; enhanced scanning
+and the blocking gate below remain proposed. A successful image build is not
+evidence that this gate ran.
+
 The ECR repository uses enhanced scanning (scan on push, then continuous
 rescanning) and immutable tags. The gate runs after the push, and again at the
 start of the Production stage:
@@ -515,7 +537,9 @@ unpredictable.
 
 ## 6. Monitoring
 
-Everything here is proposed. Nothing is configured yet.
+Application dashboards, instrumentation, and alarms remain proposed.
+CodeBuild logs and reports, plus existing ALB and RDS service metrics, are
+available; their presence does not establish an operational alerting setup.
 
 **Logs.** CodeBuild writes build and deploy logs to one CloudWatch Logs group
 per project. CodePipeline execution events go through EventBridge to SNS for
@@ -533,7 +557,7 @@ period set.
 | Pod CPU and memory against requests, restarts, running pods | Container Insights (Observability add-on) | Available once the add-on is installed |
 | Database: connections, CPU, free storage and memory, read and write latency | RDS CloudWatch metrics (`DatabaseConnections`, `CPUUtilization`, `FreeStorageSpace`, `FreeableMemory`, `ReadLatency`, `WriteLatency`) | Available now for the staging instance; no app change. There is no read replica, so no replica-lag metric. |
 | Per-operation latency, errors, and faults; SLOs | CloudWatch Application Signals: OpenTelemetry auto-instrumentation from the add-on, enabled by the pod annotation `instrumentation.opentelemetry.io/inject-python: "true"` | Supports Python 3.10–3.14. The single Uvicorn worker avoids the documented pre-fork caveat. |
-| Build and deploy outcome and duration | CodeBuild metrics, CodePipeline events | Available once the pipeline exists |
+| Build and deploy outcome and duration | CodeBuild metrics, CodePipeline events | CodeBuild metrics available for existing projects; CodePipeline events remain proposed |
 | Payment completion: webhooks received, signature-rejected, processed, failed, duplicate; processing lag | Application metrics (CloudWatch Embedded Metric Format) | **Needs instrumentation** |
 | Database pool: wait time, connections in use, checkout timeouts | Application metrics | **Needs instrumentation** |
 | Batch freshness: last successful completion time, business period, records processed | Application metric at batch end | **Needs instrumentation** |
@@ -638,3 +662,18 @@ data point counts as breaching; missing 5xx data does not.
 | Secrets loader (`scripts/load_secrets.py`) | Implemented. Offline tests only. The operator stored the staging secret with the AWS CLI instead; the agent never ran the loader or saw a value. |
 | Deployer RBAC (`platform/deploy-rbac.yaml`) and the bootstrap manifests in `platform/eks/` | Applied once to the staging cluster (the staging binding only); checked by impersonation. |
 | Everything else in this document: CodePipeline, production, image gate, Inspector, monitoring, alarms, private-endpoint networking | Proposed only |
+
+Recorded successful builds (the source revision identifies the build's code,
+not necessarily the application image it deployed):
+
+| Project | Source revision | Build ID |
+| --- | --- | --- |
+| `mobile-api-validate` | `643dbb7` | `cb87b2e3-5aab-40ef-af95-9f7de6ae640f` |
+| `mobile-api-deploy-staging` | `643dbb7` | `f0526314-041d-423e-b294-8a67c39dae4f` |
+| `mobile-api-db-admin` | `73de0a8` | `6f6c2137-f44a-4457-8706-53282bbf7e0a` |
+| `mobile-api-integration` | `73de0a8` | `d3bd2a66-e146-4c60-a4a8-800b0a0c0da0` |
+| `mobile-api-secrets-sync` | `73de0a8` | `1de29198-37ef-41a8-bc68-9a2a9855dbad` |
+
+Release-image build evidence is recorded in the root README. Historical
+digest prefixes above are identifiers reported by the build agent; they do
+not substitute for a complete image digest or release receipt.
