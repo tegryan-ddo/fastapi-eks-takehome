@@ -3,6 +3,8 @@
 .env.*
 *.pem
 *.key
+# Public RDS certificate authorities, copied into the image. Not a credential.
+!examples/demo-api/certs/rds-global-bundle.pem
 kubeconfig
 *.kubeconfig
 .kube/
@@ -15,13 +17,15 @@ __pycache__/
 venv/
 .pytest_cache/
 
-# Build output, packaged charts, downloaded tools, test reports
+# Build output, packaged charts, downloaded tools, test reports, CDK output
 build/
 dist/
 *.tgz
 charts/*/charts/
 .tools/
 reports/
+cdk.out/
+release.json
 
 # Editors and OS
 .vscode/

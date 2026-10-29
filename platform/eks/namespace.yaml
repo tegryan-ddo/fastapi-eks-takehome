@@ -1,0 +1,10 @@
+# Staging namespace. Applied once by a cluster administrator.
+# The restricted Pod Security Standard is enforced; every workload in the
+# chart, the migration hook, and the deploy project's check Job comply.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mobile-api-staging
+  labels:
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/warn: restricted

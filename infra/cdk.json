@@ -1,0 +1,12 @@
+{
+  "app": "python app.py",
+  "watch": {
+    "include": ["**"],
+    "exclude": ["cdk.out", ".venv", "**/__pycache__", "tests"]
+  },
+  "context": {
+    "domainName": "mobile-api-staging.digitaldevops.io",
+    "hostedZoneId": "Z3OKT7D3Q3TASV",
+    "certificateArn": "arn:aws:acm:us-east-1:882384879235:certificate/411f9b4a-bc8f-4342-b7e6-52f39251fa3a"
+  }
+}

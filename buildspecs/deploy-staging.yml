@@ -1,0 +1,170 @@
+# Staging deployment, run by the "mobile-api-deploy-staging" CodeBuild project
+# (infra/eks_stack.py). Started by hand with IMAGE_TAG set to the commit SHA
+# that buildspecs/build.yml pushed:
+#
+#   aws codebuild start-build --project-name mobile-api-deploy-staging \
+#     --environment-variables-override name=IMAGE_TAG,value=<commit sha>
+#
+# Without IMAGE_TAG the most recently pushed image is deployed. The project
+# supplies CLUSTER_NAME, NAMESPACE, ECR_REPOSITORY_URI and, when HTTPS is
+# configured, INGRESS_HOST, CERTIFICATE_ARN and HOSTED_ZONE_ID.
+#
+# Steps: Helm upgrade (the migration hook runs first), rollout check, image
+# digest check on every API pod, HTTPS smoke test and a database write/read
+# through the public hostname, then the manual batch Job from
+# docs/verification.md. Without HTTPS the HTTP checks run from a short-lived
+# Job inside the cluster, because the deployer role has no port-forward.
+version: 0.2
+
+env:
+  shell: bash
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.13
+    commands:
+      - python -m pip install --no-cache-dir -r requirements-dev.txt
+      - export PATH="$(python scripts/tools.py --path):$PATH"
+      - helm version --short && kubectl version --client
+  pre_build:
+    commands:
+      - aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+      - |
+        set -euo pipefail
+        REPO_NAME="${ECR_REPOSITORY_URI#*/}"
+        if [ -z "${IMAGE_TAG:-}" ]; then
+          IMAGE_TAG=$(aws ecr describe-images --repository-name "$REPO_NAME" \
+            --query 'sort_by(imageDetails,&imagePushedAt)[-1].imageTags[0]' --output text)
+          echo "IMAGE_TAG not given; deploying the most recently pushed tag"
+        fi
+        DIGEST=$(aws ecr describe-images --repository-name "$REPO_NAME" --image-ids imageTag="$IMAGE_TAG" \
+          --query 'imageDetails[0].imageDigest' --output text)
+        CHART_APP_VERSION=$(python -c "import yaml; print(yaml.safe_load(open('charts/mobile-api/Chart.yaml'))['appVersion'])")
+        export IMAGE_TAG DIGEST APP_VERSION="${CHART_APP_VERSION}-${IMAGE_TAG:0:7}"
+        echo "Deploying $ECR_REPOSITORY_URI@$DIGEST (tag $IMAGE_TAG, APP_VERSION $APP_VERSION)"
+  build:
+    commands:
+      - |
+        set -euo pipefail
+        VALUES_EXTRA=$(mktemp)
+        if [ -n "${INGRESS_HOST:-}" ] && [ -n "${CERTIFICATE_ARN:-}" ]; then
+          cat > "$VALUES_EXTRA" <<EOF
+        ingress:
+          enabled: true
+          className: alb
+          host: "$INGRESS_HOST"
+          annotations:
+            alb.ingress.kubernetes.io/scheme: internet-facing
+            alb.ingress.kubernetes.io/target-type: ip
+            alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80},{"HTTPS":443}]'
+            alb.ingress.kubernetes.io/ssl-redirect: "443"
+            alb.ingress.kubernetes.io/certificate-arn: "$CERTIFICATE_ARN"
+            alb.ingress.kubernetes.io/healthcheck-path: /health/ready
+        EOF
+        else
+          echo "ingress: {enabled: false}" > "$VALUES_EXTRA"
+          echo "HTTPS is not configured; HTTP checks will run from inside the cluster"
+        fi
+        HELM_DRIVER=configmap helm upgrade --install mobile-api charts/mobile-api \
+          --namespace "$NAMESPACE" -f environments/staging.yaml -f "$VALUES_EXTRA" \
+          --set image.repository="$ECR_REPOSITORY_URI" --set image.digest="$DIGEST" \
+          --rollback-on-failure --wait=watcher --timeout 10m --history-max 20
+        kubectl rollout status deployment/mobile-api -n "$NAMESPACE" --timeout=5m
+        # Old pods are still terminating (preStop + graceful shutdown) after the
+        # rollout completes, and a pod waiting for a node has no image yet, so
+        # only Running pods without a deletion timestamp count.
+        kubectl get pods -n "$NAMESPACE" -l app.kubernetes.io/component=api --field-selector=status.phase=Running \
+          -o go-template='{{range .items}}{{if not .metadata.deletionTimestamp}}{{(index .status.containerStatuses 0).imageID}}{{"\n"}}{{end}}{{end}}' | tee api-pods.txt
+        if [ ! -s api-pods.txt ] || grep -qv "$DIGEST" api-pods.txt; then
+          echo "An API pod is not running $DIGEST"; exit 1
+        fi
+      - |
+        set -euo pipefail
+        NOTE="deploy-staging build $CODEBUILD_BUILD_NUMBER $(date -u +%Y%m%dT%H%M%SZ)"
+        if [ -n "${INGRESS_HOST:-}" ] && [ -n "${CERTIFICATE_ARN:-}" ]; then
+          ALB=""
+          for attempt in $(seq 1 60); do
+            ALB=$(kubectl get ingress mobile-api -n "$NAMESPACE" -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+            [ -n "$ALB" ] && break
+            sleep 10
+          done
+          if [ -z "$ALB" ]; then
+            echo "The Ingress has no load balancer after 10 minutes"
+            kubectl describe ingress mobile-api -n "$NAMESPACE"; exit 1
+          fi
+          echo "ALB: $ALB"
+          CHANGE=$(aws route53 change-resource-record-sets --hosted-zone-id "$HOSTED_ZONE_ID" --query 'ChangeInfo.Id' --output text \
+            --change-batch "{\"Changes\":[{\"Action\":\"UPSERT\",\"ResourceRecordSet\":{\"Name\":\"$INGRESS_HOST\",\"Type\":\"CNAME\",\"TTL\":60,\"ResourceRecords\":[{\"Value\":\"$ALB\"}]}}]}")
+          aws route53 wait resource-record-sets-changed --id "$CHANGE"
+          BASE_URL="https://$INGRESS_HOST"
+          # The ALB and DNS take a few minutes; the smoke test retries until ready.
+          python scripts/smoke_test.py "$BASE_URL" --expect-demo --expect-version "$APP_VERSION" \
+            --ready-deadline 600 --retry-interval 10
+          CREATED=$(curl -fsS -X POST "$BASE_URL/demo/records" -H 'content-type: application/json' -d "{\"note\":\"$NOTE\"}")
+          ID=$(python -c "import json, sys; print(json.loads(sys.argv[1])['id'])" "$CREATED")
+          READ=$(curl -fsS "$BASE_URL/demo/records/$ID")
+          python -c "import json, sys; r = json.loads(sys.argv[1]); assert (r['id'], r['note']) == (int(sys.argv[2]), sys.argv[3]), r; print('write/read through', sys.argv[4], 'ok:', r)" "$READ" "$ID" "$NOTE" "$BASE_URL"
+        else
+          # Same checks from a Job inside the cluster, using the application image
+          # (it already satisfies the namespace's restricted pod security).
+          BASE_URL="http://mobile-api.$NAMESPACE.svc"
+          CHECK=mobile-api-check-$CODEBUILD_BUILD_NUMBER
+          cat <<EOF | kubectl apply -f -
+        apiVersion: batch/v1
+        kind: Job
+        metadata: {name: $CHECK, namespace: $NAMESPACE, labels: {app.kubernetes.io/component: check}}
+        spec:
+          backoffLimit: 0
+          activeDeadlineSeconds: 300
+          ttlSecondsAfterFinished: 3600
+          template:
+            metadata: {labels: {app.kubernetes.io/component: check}}
+            spec:
+              restartPolicy: Never
+              automountServiceAccountToken: false
+              securityContext: {runAsNonRoot: true, runAsUser: 10001, runAsGroup: 10001, seccompProfile: {type: RuntimeDefault}}
+              containers:
+                - name: check
+                  image: "$ECR_REPOSITORY_URI@$DIGEST"
+                  securityContext: {allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: {drop: [ALL]}}
+                  env: [{name: BASE_URL, value: "$BASE_URL"}, {name: NOTE, value: "$NOTE"}, {name: APP_VERSION_EXPECTED, value: "$APP_VERSION"}]
+                  command: ["python", "-c"]
+                  args:
+                    - |
+                      import json, os, urllib.request
+                      base = os.environ["BASE_URL"]
+                      def call(method, path, body=None):
+                          data = json.dumps(body).encode() if body is not None else None
+                          req = urllib.request.Request(base + path, data=data, method=method, headers={"content-type": "application/json"})
+                          with urllib.request.urlopen(req, timeout=5) as r: return json.load(r)
+                      root = call("GET", "/")
+                      assert root["demo"] is True and root["version"] == os.environ["APP_VERSION_EXPECTED"], root
+                      assert call("GET", "/health/ready") == {"status": "ready"}
+                      created = call("POST", "/demo/records", {"note": os.environ["NOTE"]})
+                      read = call("GET", f"/demo/records/{created['id']}")
+                      assert (read["id"], read["note"]) == (created["id"], os.environ["NOTE"]), read
+                      print("write/read through", base, "ok:", read)
+        EOF
+          if ! kubectl wait --for=condition=complete "job/$CHECK" -n "$NAMESPACE" --timeout=5m; then
+            kubectl describe "job/$CHECK" -n "$NAMESPACE"; kubectl logs "job/$CHECK" -n "$NAMESPACE" || true; exit 1
+          fi
+          kubectl logs "job/$CHECK" -n "$NAMESPACE"
+        fi
+      - |
+        set -euo pipefail
+        # Manual batch run, as in docs/verification.md.
+        JOB=mobile-api-batch-manual-$(date -u +%Y%m%d%H%M%S)
+        kubectl get jobs -n "$NAMESPACE" -l app.kubernetes.io/component=batch
+        kubectl create job "$JOB" --from=cronjob/mobile-api-batch -n "$NAMESPACE"
+        if ! kubectl wait --for=condition=complete "job/$JOB" -n "$NAMESPACE" --timeout=10m; then
+          kubectl describe "job/$JOB" -n "$NAMESPACE"
+          kubectl logs "job/$JOB" -n "$NAMESPACE" --timestamps || true
+          exit 1
+        fi
+        kubectl logs "job/$JOB" -n "$NAMESPACE" --timestamps
+        kubectl get job "$JOB" -n "$NAMESPACE" -o jsonpath='{.spec.template.spec.containers[0].image}{"\n"}'
+        kubectl get pods -n "$NAMESPACE" -l batch.kubernetes.io/job-name="$JOB" \
+          -o jsonpath='{range .items[*]}{.status.containerStatuses[0].imageID}{"\n"}{end}' | tee batch-pods.txt
+        if grep -qv "$DIGEST" batch-pods.txt; then echo "The batch pod did not run $DIGEST"; exit 1; fi
+        echo "Deployed $ECR_REPOSITORY_URI@$DIGEST to $NAMESPACE on $CLUSTER_NAME"

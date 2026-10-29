@@ -2,20 +2,49 @@
 
 Helm deployment of a Python/FastAPI service (`mobile-api`) to an existing
 Amazon EKS cluster. The service serves HTTP on port 8000, uses an external
-Postgres database, receives payment-provider webhooks, and runs a daily batch
+PostgreSQL database, receives payment-provider webhooks, and runs a daily batch
 job. Expected load is 2,000–3,000 requests per second at peak and about a tenth
 of that overnight.
+
+The demonstration includes real PostgreSQL persistence through Amazon RDS. The
+RDS instance is provisioned by [infra/](infra/README.md) only to reproduce the
+external database dependency for this exercise. The Helm chart consumes that
+dependency; it does not run PostgreSQL inside Kubernetes.
+
+> **Demo application assumption.** Only the assignment brief was supplied. The
+> included FastAPI application demonstrates container startup, health checks,
+> shutdown, PostgreSQL reads and writes, schema migration, and batch execution.
+> The payment-provider integration, the employer's business logic, and
+> production throughput remain unverified.
+
+> **HPA assumption.** CPU utilization is the initial HPA signal. Before
+> production, confirm or refine that choice with the application team and
+> representative load tests. Database or I/O waits may increase latency without
+> increasing CPU. Replica limits also need to respect the database connection
+> budget: each pod holds up to 5 connections.
+
+> **Manual staging job validation.** Automatic batch scheduling is suspended in
+> staging. Before promotion, a Job is created manually from the deployed CronJob
+> template and its result inspected (see
+> [docs/verification.md](docs/verification.md#manual-staging-batch-run)). The
+> demo batch writes one `batch_runs` row per business date and increments its
+> `run_count` on replay. For the real application, acceptance also requires the
+> expected business output and a safe replay of the same business period.
 
 ## Status
 
 | Area | Status |
 | --- | --- |
-| Smoke-test app and container image | Done; image built and run with Podman 5.7.1 under the chart's restrictions, and the smoke test passes |
-| Chart: Deployment, ClusterIP Service, ServiceAccount | Done, linted, rendered, and schema-validated; **not yet installed on a cluster** |
-| Staging and production values | Minimal (replica counts only) |
-| Verification: chart tests, smoke test, secret scan, validation buildspec | Done and run locally; buildspec not yet run in CodeBuild |
-| Delivery and monitoring (AWS CodePipeline, CodeBuild, CloudWatch) | Proposal only: [docs/operations.md](docs/operations.md) |
-| Ingress and TLS, secrets, autoscaling, disruption budget, topology spread, daily CronJob | Not started |
+| Demo application: HTTP API with PostgreSQL persistence, migration command, batch command | Done; unit-tested, and checked locally against a PostgreSQL 17 container |
+| Container image | Built, checked, and pushed to ECR by the `mobile-api-build` CodeBuild project (tag = commit SHA); also checked locally with Podman |
+| Chart: Deployment, Service, ServiceAccount, HPA, PDB, CronJob, migration hook Job, Ingress, secret references | Linted, rendered, schema-validated, relationship-checked, and installed on the staging cluster by `mobile-api-deploy-staging` (Helm release `mobile-api`, three revisions on 2026-10-29: one install, two upgrades) |
+| Staging database: VPC, RDS PostgreSQL 17, VPC-connected db-admin and integration runners | Provisioned by [infra/](infra/README.md) (CDK). `mobile-api-db-admin` created the application role; `mobile-api-integration` applied the schema and passed the 6 integration tests against RDS over TLS |
+| Build path: ECR repository, CodeConnections, CodeBuild validate and build projects | Provisioned by [infra/](infra/README.md) (CDK). `mobile-api-validate` runs on pull requests through the GitHub App webhook; `mobile-api-build` has pushed two images tagged by commit SHA |
+| Staging cluster: EKS 1.37 Auto Mode `mobile-api-staging` in the RDS VPC with the `metrics-server` add-on, `mobile-api-secrets-sync` (writes the Kubernetes Secret `mobile-api-runtime` from Secrets Manager), `mobile-api-deploy-staging` (runs Helm and the checks) | Provisioned by [infra/](infra/README.md) (CDK). The demo runs on it and answers at `https://mobile-api-staging.digitaldevops.io`; the HPA reads CPU; the CronJob is suspended as designed |
+| Ingress (ALB, HTTPS) | Enabled in staging by the deploy build: an ALB from EKS Auto Mode, the account's `*.digitaldevops.io` ACM certificate, a Route53 CNAME. Verified from outside the cluster with certificate verification |
+| Secrets loader (`scripts/load_secrets.py`) | Included; offline tests pass with dummy values and mocked AWS clients |
+| Delivery pipeline, production deploy project, monitoring | Written proposal: [docs/operations.md](docs/operations.md) |
+| Topology spread, production database | Not started |
 
 Reasons and assumptions are in [docs/decisions.md](docs/decisions.md).
 
@@ -23,90 +52,110 @@ Reasons and assumptions are in [docs/decisions.md](docs/decisions.md).
 
 ```text
 charts/mobile-api/            Helm application chart
-  Chart.yaml
   values.yaml                 defaults shared by every environment
-  templates/                  Deployment, Service, ServiceAccount, _helpers.tpl
-environments/staging.yaml     staging overrides
-environments/production.yaml  production overrides
-examples/demo-api/            smoke-test FastAPI app and its Dockerfile
-tests/chart/                  chart lint, schema, and relationship checks (pytest)
-scripts/                      pinned tool downloads, smoke test, secret scan
-buildspecs/validate.yml       CodeBuild validation build (proposed, not run in AWS)
-platform/deploy-rbac.yaml     Kubernetes RBAC for the deploy roles (proposed, not applied)
+  templates/                  Deployment, Service, ServiceAccount, HPA, PDB, CronJob,
+                              migration hook Job, Ingress (off by default)
+environments/staging.yaml     staging overrides (CronJob suspended)
+environments/production.yaml  production overrides (HPA range)
+examples/demo-api/            demo FastAPI app (package app/, app/migrations/) and Dockerfile
+infra/                        CDK: ECR, CodeConnections, CodeBuild, VPC, RDS, VPC runners,
+                              EKS Auto Mode cluster, deploy and secrets-sync projects
+platform/deploy-rbac.yaml     Kubernetes RBAC for the deploy roles (applied on staging)
+platform/eks/                 one-time cluster bootstrap: namespace, IngressClass, sync RBAC
+platform/db/                  SQL run once by the db-admin runner to create the app role
+scripts/                      container check, smoke test, secret scan, secrets loader,
+                              pinned tool downloads
+tests/                        chart, demo app, integration, and secrets-loader tests
+buildspecs/                   CodeBuild: validate (pull requests), build (pushes to main; pushes
+                              the image), db-bootstrap, integration, secrets-sync, deploy-staging
 docs/decisions.md             assumptions and reasons for consequential choices
-docs/operations.md            delivery and monitoring proposal (AWS)
-docs/verification.md          what each check catches; staging acceptance plan
+docs/operations.md            delivery, secrets, RDS, and monitoring design (AWS)
+docs/verification.md          what each check catches; manual batch run; acceptance plan
 ```
 
 ## The demo application
 
-No real application was supplied, so `examples/demo-api/` is a **deployment
-smoke-test harness**, not the service. It exists only to prove the image and
-chart work end to end. Its readiness endpoint confirms only that the demo has
-started. It does not check Postgres, payment processing, or anything the real
-application needs.
-
-| Endpoint | Response |
+| Command or endpoint | Behaviour |
 | --- | --- |
-| `GET /` | `200 {"service":"demo-api","version":"<APP_VERSION>"}` |
-| `GET /health/live` | `200 {"status":"ok"}` while the process can respond |
-| `GET /health/ready` | `200 {"status":"ready"}` once startup has completed |
+| `GET /` | `200 {"service":"demo-api","version":"<APP_VERSION>","demo":true}` |
+| `GET /health/live` | `200 {"status":"ok"}` whenever the process can answer. Never touches the database. |
+| `GET /health/ready` | `200 {"status":"ready"}` only after lifespan startup **and** a pooled `SELECT 1` that completes within 1.5s. Otherwise `503 {"status":"not ready","reason":"starting"\|"database unavailable"}`. It checks connectivity only, not payments or business data. |
+| `POST /demo/records {"note": "..."}` | `201` with the stored record. Synthetic demonstration data, up to 200 characters. |
+| `GET /demo/records/{id}`, `GET /demo/records?limit=N` | Read records back from PostgreSQL. |
+| `GET /demo/batch-runs/{business_date}` | The batch summary row for that date: `record_count`, `run_count`, first and last run time. |
+| `python -m app.migrate` | Applies `app/migrations/NNNN_*.sql` in order, once each, tracked in `schema_migrations` under an advisory lock. Idempotent; exits 1 on failure. Run before the application, never from API pods. |
+| `python -m app.batch [--business-date YYYY-MM-DD]` | Counts `demo_records` and upserts one `batch_runs` row for the date in one transaction. Replaying the same date updates that row and increments `run_count`. Exits 0, 2 for bad arguments, 1 for a configuration or database failure. Default date: current UTC date (a demo default). |
+
+Every command needs `DATABASE_URL`
+(`postgresql://user:password@host:5432/mobileapi?sslmode=verify-full`). Without
+it, or with an unreachable database at migrate or batch time, the command logs
+a clear error and exits non-zero. There is no in-memory fallback. The API
+starts without the database and reports not ready until it can reach it. TLS
+is verified against the RDS global certificate bundle baked into the image;
+`sslmode=disable` is for local throwaway databases only.
+
+The image runs one Uvicorn worker on `0.0.0.0:8000` as UID 10001. Application
+events are JSON lines on stdout (errors on stderr) and never contain
+credentials, the database URL, environment dumps, or request bodies. Uvicorn's
+own startup and access lines are plain text.
 
 ## Prerequisites
 
-- Docker 24 or later. Podman also works; replace `docker` with `podman`.
-- Helm 3.x or 4.x. Verified with Helm 3.22.1 and 4.3.1. The verification
-  commands below download their own pinned Helm.
+- Docker 24 or later, or Podman. Replace `docker` with `podman` if needed.
 - Python 3.12 or later for the verification commands.
-- `curl`.
-- A POSIX shell (bash, zsh, or Git Bash on Windows). Run commands from the
-  repository root.
+- Helm 4.x (verified with 4.3.1). Lint and template also work with Helm 3.x,
+  but the deploy command below uses Helm 4 flags. The verification commands
+  download their own pinned Helm.
+- `curl`, and a POSIX shell (bash, zsh, or Git Bash on Windows). Run commands
+  from the repository root. In Git Bash, run `export MSYS_NO_PATHCONV=1` first,
+  or it rewrites `/tmp` in the `docker run` commands into a Windows path.
 
-## Run the container locally
+## Build and run locally
 
-Build the image. `APP_VERSION` is baked into the image and reported by `GET /`.
+A throwaway PostgreSQL container stands in for RDS. It trusts local connections
+and holds no real data, which is why `sslmode=disable` is acceptable here.
 
 ```sh
+docker network create demo
+docker run -d --rm --name demo-postgres --network demo \
+  -e POSTGRES_HOST_AUTH_METHOD=trust -e POSTGRES_USER=demo -e POSTGRES_DB=mobileapi \
+  public.ecr.aws/docker/library/postgres:17.11-alpine
+
 docker build --build-arg APP_VERSION=0.1.0 -t demo-api:0.1.0 examples/demo-api
-```
 
-Run it with the same restrictions the chart applies: read-only root filesystem
-with a writable `/tmp`, no Linux capabilities, and no privilege escalation. The
-image already runs as UID 10001, and Docker applies its default seccomp
-profile.
+# Same restrictions as the chart: read-only root filesystem, writable /tmp,
+# no Linux capabilities, no privilege escalation (the image runs as UID 10001)
+run() {
+  docker run --rm --network demo --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
+    -e DATABASE_URL=postgresql://demo@demo-postgres:5432/mobileapi?sslmode=disable "$@"
+}
 
-```sh
-docker run -d --rm --name demo-api -p 8000:8000 \
-  --read-only --tmpfs /tmp \
-  --cap-drop ALL --security-opt no-new-privileges \
-  demo-api:0.1.0
-```
+# PostgreSQL takes a few seconds to accept connections on first start
+for i in $(seq 1 30); do docker exec demo-postgres pg_isready -U demo -q && break; sleep 1; done
 
-In Git Bash on Windows, run `export MSYS_NO_PATHCONV=1` first. Otherwise
-Git Bash rewrites `/tmp` into a Windows path and the container does not start.
+run demo-api:0.1.0 python -m app.migrate                        # apply the schema first
+run -d --name demo-api -p 8000:8000 demo-api:0.1.0              # then the API
 
-Call the endpoints:
-
-```sh
-curl -i http://localhost:8000/
-curl -i http://localhost:8000/health/live
 curl -i http://localhost:8000/health/ready
+curl -i -X POST http://localhost:8000/demo/records -H 'content-type: application/json' -d '{"note":"hello"}'
+curl -i http://localhost:8000/demo/records/1
+python scripts/smoke_test.py http://localhost:8000 --expect-version 0.1.0 --expect-demo
+
+run demo-api:0.1.0 python -m app.batch --business-date 2026-10-27    # run_count 1
+run demo-api:0.1.0 python -m app.batch --business-date 2026-10-27    # same row, run_count 2
+curl -i http://localhost:8000/demo/batch-runs/2026-10-27
+
+docker stop demo-api demo-postgres   # SIGTERM; both are removed because of --rm
+docker network rm demo
 ```
 
-Or run the smoke test, which waits for readiness and checks the response:
+`python scripts/verify_container.py` performs all of the above as one check,
+and also replaces the API container between the write and the read, stops and
+restarts the database to confirm readiness fails and recovers while liveness
+stays up, times the SIGTERM shutdown, and checks invalid batch input and a
+missing `DATABASE_URL`.
 
-```sh
-python scripts/smoke_test.py http://localhost:8000 --expect-version 0.1.0
-```
-
-Stop the container. It is removed automatically because it was started with
-`--rm`.
-
-```sh
-docker stop demo-api
-```
-
-## Lint and render the chart
+## Render the chart
 
 ```sh
 helm lint charts/mobile-api -f environments/staging.yaml
@@ -116,35 +165,127 @@ helm template mobile-api charts/mobile-api -f environments/staging.yaml
 helm template mobile-api charts/mobile-api -f environments/production.yaml
 ```
 
-The image tag defaults to the chart's `appVersion`. Deployments should set a
-tag or, preferably, an immutable digest. When both are set, the digest wins.
+The output includes the migration hook Job, which Helm runs before the other
+resources on install and upgrade. The image tag defaults to the chart's
+`appVersion`. A deployment should pin an immutable digest, which then takes
+precedence over any tag for the API, the batch job, and the migration Job:
 
 ```sh
-helm template mobile-api charts/mobile-api -f environments/production.yaml \
-  --set image.tag=0.1.0
-
 DIGEST=sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 helm template mobile-api charts/mobile-api -f environments/production.yaml \
   --set image.digest=$DIGEST
 ```
+
+## Set up the staging database and secrets (operator)
+
+The staging RDS instance, its VPC, and two VPC-connected CodeBuild runners are
+created by [infra/](infra/README.md). No database password appears in Git or
+passes through an AI agent; the two VPC runners receive credentials from
+Secrets Manager at run time, inside the VPC. The steps, in order (all three
+were done for staging on 2026-10-29):
+
+1. **Load the application secret** from your own trusted terminal. The
+   database password is one you choose for the application role; type it only
+   at the hidden prompts.
+
+   ```sh
+   python -m pip install -r requirements-secrets.txt
+   aws sso login --profile <profile>
+   python scripts/load_secrets.py --profile <profile> --region us-east-1 \
+     --expected-account-id <account-id> --secret-name /mobile-api/staging/runtime
+   # DATABASE_URL: postgresql://mobile_api_app:<password>@<rds-endpoint>:5432/mobileapi?sslmode=verify-full
+   # PAYMENTS_WEBHOOK_SECRET: any value for the demo
+   ```
+
+   For staging, the operator chose a different route with the same boundary:
+   `aws secretsmanager create-secret --name /mobile-api/staging/runtime
+   --secret-string file://<local file>` from their own machine, then deleted
+   the file. The values never reached Git or the agent. The loader remains the
+   designed path because it writes nothing to disk.
+
+2. **Create the application role once.** Start the `mobile-api-db-admin`
+   CodeBuild project. It connects as the RDS master user and runs
+   `platform/db/create_app_user.sql`, creating `mobile_api_app` with the
+   password from the secret you just loaded. The master credentials stay in
+   Secrets Manager (`/mobile-api/staging/rds-master`) and are used by nothing
+   else.
+
+3. **Migrate and test against RDS.** Start the `mobile-api-integration`
+   CodeBuild project. It runs `python -m app.migrate` and then
+   `python -m pytest tests/integration` inside the VPC, with `DATABASE_URL`
+   injected from the secret. On staging it applied `0001_initial` and passed
+   all 6 tests with `sslmode=verify-full`.
+
+Uploading a secret and making it available to pods are separate steps. See
+[docs/operations.md](docs/operations.md#application-secrets) for the cluster
+integration, the restart needed after a change, and the tool's limits.
+
+## Deploy with your own environment values
+
+This is what `mobile-api-deploy-staging` runs
+([buildspecs/deploy-staging.yml](buildspecs/deploy-staging.yml)); it has
+deployed the demo to the staging cluster three times. To deploy elsewhere, put your
+environment specifics in a values file of your own:
+
+```yaml
+# my-staging.yaml
+image:
+  repository: <account>.dkr.ecr.<region>.amazonaws.com/mobile-api
+runtimeSecret:
+  # The Kubernetes Secret your cluster's secrets integration creates from
+  # /mobile-api/staging/runtime. Required: every workload reads DATABASE_URL.
+  name: mobile-api-runtime
+```
+
+```sh
+HELM_DRIVER=configmap helm upgrade --install mobile-api charts/mobile-api \
+  --namespace mobile-api-staging \
+  -f environments/staging.yaml -f my-staging.yaml \
+  --set image.digest=$DIGEST \
+  --rollback-on-failure --wait=watcher --timeout 10m
+```
+
+Those are Helm 4 flags; with Helm 3 use `--atomic --wait` instead.
+
+To expose the API, enable the Ingress in the same file with your host and the
+ALB annotations shown in `environments/staging.yaml`. TLS terminates at the
+ALB with an ACM certificate; the chart holds no certificate.
+
+The cluster needs:
+
+- the namespace;
+- the Secret named by `runtimeSecret.name`, **before** the first install: the
+  migration hook reads `DATABASE_URL` from it;
+- network access from the pods to RDS on port 5432 (see
+  [docs/operations.md](docs/operations.md#rds-environment));
+- metrics-server, which the HPA reads CPU metrics from. EKS Auto Mode does not
+  include it; the staging cluster gets it as a managed add-on from
+  [infra/](infra/README.md);
+- an IngressClass named `alb` with an ALB controller behind it (EKS Auto Mode
+  provides the controller), if the Ingress is enabled;
+- the deployer RBAC in `platform/deploy-rbac.yaml`, if you deploy with the
+  pipeline's role. On staging these came from the one-time bootstrap in
+  `platform/eks/` plus that file.
+
+`HELM_DRIVER=configmap` keeps Helm's release history out of Secrets; see
+[docs/operations.md](docs/operations.md#2-permissions).
 
 ## Verify
 
 ```sh
 python -m pip install -r requirements-dev.txt
 
-# Chart: lint both environments, render, validate against Kubernetes 1.30
-# schemas, and check selectors, ports, image reference, security settings,
-# and that platform/deploy-rbac.yaml can deploy the chart
-python -m pytest
-
-# Secrets: Git history and working-tree files, findings redacted
-python scripts/secret_scan.py
+python -m pytest                     # chart, demo app, and secrets-loader tests
+python scripts/verify_container.py   # build and check the image with a PostgreSQL container
+python scripts/secret_scan.py        # Git history and working tree, redacted
 ```
 
-The first run downloads pinned, checksum-verified Helm, kubeconform, and
-gitleaks binaries into `.tools/`. See [docs/verification.md](docs/verification.md)
-for what each check catches and the staging acceptance plan.
+`tests/integration` runs where `DATABASE_URL` points at a reachable database:
+locally against the container above, or in the `mobile-api-integration` runner
+against RDS, where it has passed. The first run downloads pinned,
+checksum-verified Helm, kubeconform, gitleaks, and kubectl binaries into
+`.tools/`. [docs/verification.md](docs/verification.md) lists what each check
+catches, what ran on staging, and what still needs the real application.
 
 ## How Helm combines values
 
@@ -153,14 +294,12 @@ precedence:
 
 1. `charts/mobile-api/values.yaml`: the chart defaults.
 2. Each `-f` file, in order. A later file overrides an earlier one.
-3. Each `--set` flag. This is how a pipeline supplies the image tag or digest
-   at deploy time.
+3. Each `--set` flag. This is how a pipeline supplies the image digest at
+   deploy time.
 
 Maps are merged key by key. `environments/production.yaml` sets only
-`replicaCount: 3`, so every other value, such as `image.repository`,
-`resources`, and the probes, still comes from `values.yaml`. Lists and scalar
-values are replaced whole, not merged. Setting a key to `null` removes the
-default.
-
-Environment files therefore hold only what differs per environment, and never
-credentials.
+`autoscaling.minReplicas` and `autoscaling.maxReplicas`, so
+`autoscaling.targetCPUUtilizationPercentage`, the probes, and everything else
+still come from `values.yaml`. Lists and scalar values are replaced whole.
+Setting a key to `null` removes the default. Environment files hold only what
+differs per environment, and never credentials.

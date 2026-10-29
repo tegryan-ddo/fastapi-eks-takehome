@@ -7,9 +7,10 @@ Waits up to --ready-deadline seconds for the readiness endpoint, then checks
 the liveness endpoint and the service identity returned by GET /. HTTPS
 certificates are verified.
 
-A pass shows only that the service is reachable, ready, and is the expected
-build. The demo's health endpoints do not exercise Postgres, payment
-processing, or the batch job.
+A pass shows that the service is reachable, reports ready (which for this
+application includes a bounded PostgreSQL connectivity check), and is the
+expected build. It does not exercise payment processing, the batch job, or
+data correctness.
 """
 
 import argparse
@@ -82,6 +83,8 @@ def expect_identity(args):
             return f"service {data.get('service')!r}, expected {args.expect_service!r}"
         if args.expect_version and data.get("version") != args.expect_version:
             return f"version {data.get('version')!r}, expected {args.expect_version!r}"
+        if args.expect_demo and data.get("demo") is not True:
+            return f"demo {data.get('demo')!r}, expected true"
         return None
 
     return expect
@@ -96,6 +99,7 @@ def main():
     parser.add_argument("base_url", help="e.g. http://localhost:8000 or https://staging.example.com")
     parser.add_argument("--expect-service", default="demo-api", help="expected 'service' in GET / (default: demo-api)")
     parser.add_argument("--expect-version", help="expected 'version' in GET /; not checked if omitted")
+    parser.add_argument("--expect-demo", action="store_true", help="require 'demo': true in GET / (demo image only)")
     parser.add_argument("--connect-timeout", type=float, default=3, help="seconds to connect, including TLS (default: 3)")
     parser.add_argument("--response-timeout", type=float, default=5, help="seconds to wait for response data (default: 5)")
     parser.add_argument("--ready-deadline", type=float, default=60, help="seconds to wait for readiness (default: 60)")
@@ -110,8 +114,8 @@ def main():
         check(args, LIVE_PATH, expect_ok),
         check(args, "/", expect_identity(args)),
     ])
-    print(f"{'PASSED' if passed else 'FAILED'}: {args.base_url} (reachability and identity only; "
-          "no database, payment, or batch checks)")
+    print(f"{'PASSED' if passed else 'FAILED'}: {args.base_url} (reachability, readiness including database "
+          "connectivity, and identity; no payment, batch, or data checks)")
     return 0 if passed else 1
 
 

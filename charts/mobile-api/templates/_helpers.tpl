@@ -10,6 +10,16 @@ already contains the chart name. Truncated to the 63-character DNS limit.
 {{- end -}}
 {{- end -}}
 
+{{/* CronJob name, kept to 52 characters so the Job names it generates fit. */}}
+{{- define "mobile-api.batchName" -}}
+{{- printf "%s-batch" (include "mobile-api.fullname" .) | trunc 52 | trimSuffix "-" -}}
+{{- end -}}
+
+{{/* Migration hook Job name, truncated after the suffix is added. */}}
+{{- define "mobile-api.migrateName" -}}
+{{- printf "%s-migrate" (include "mobile-api.fullname" .) | trunc 63 | trimSuffix "-" -}}
+{{- end -}}
+
 {{/*
 Labels shared by every selector in this release. Deployment selectors are
 immutable, so nothing that changes between releases (version, chart version)
@@ -28,11 +38,47 @@ app.kubernetes.io/version: {{ .Values.image.tag | default .Chart.AppVersion | qu
 app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{- end -}}
 
-{{/* Image reference: repository@digest when a digest is set, else repository:tag. */}}
+{{/*
+Image reference for every workload: repository@digest when a digest is set,
+else repository:tag.
+*/}}
 {{- define "mobile-api.image" -}}
 {{- if .Values.image.digest -}}
 {{ .Values.image.repository }}@{{ .Values.image.digest }}
 {{- else -}}
 {{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}
 {{- end -}}
+{{- end -}}
+
+{{/* Pod security settings shared by the API and batch workloads. */}}
+{{- define "mobile-api.podSecurityContext" -}}
+runAsNonRoot: true
+runAsUser: 10001
+runAsGroup: 10001
+seccompProfile:
+  type: RuntimeDefault
+{{- end -}}
+
+{{/* Container security settings shared by the API and batch workloads. */}}
+{{- define "mobile-api.containerSecurityContext" -}}
+allowPrivilegeEscalation: false
+readOnlyRootFilesystem: true
+capabilities:
+  drop: ["ALL"]
+{{- end -}}
+
+{{/*
+Environment variables referencing keys of the Kubernetes Secret created by the
+cluster's secrets integration. References only; never secret values.
+Call with (dict "secret" <Secret name> "keys" <list of key names>).
+*/}}
+{{- define "mobile-api.secretEnv" -}}
+env:
+{{- range .keys }}
+  - name: {{ . }}
+    valueFrom:
+      secretKeyRef:
+        name: {{ $.secret }}
+        key: {{ . }}
+{{- end }}
 {{- end -}}

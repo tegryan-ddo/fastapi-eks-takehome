@@ -1,0 +1,30 @@
+# Integration tests against RDS, run by the "mobile-api-integration" CodeBuild
+# project inside the VPC (infra/). Started by hand after the database
+# bootstrap. DATABASE_URL is filled by CodeBuild from Secrets Manager and is
+# never printed.
+version: 0.2
+
+env:
+  shell: bash
+  secrets-manager:
+    DATABASE_URL: "/mobile-api/staging/runtime:DATABASE_URL"
+  variables:
+    DATABASE_CA_BUNDLE: examples/demo-api/certs/rds-global-bundle.pem
+
+phases:
+  install:
+    runtime-versions:
+      python: 3.13
+    commands:
+      - python -m pip install --no-cache-dir -r requirements-dev.txt
+  build:
+    commands:
+      # The controlled schema step, run before the application is tested.
+      - PYTHONPATH=examples/demo-api python -m app.migrate
+      - python -m pytest tests/integration --junitxml=reports/integration.xml
+
+reports:
+  integration:
+    files:
+      - reports/integration.xml
+    file-format: JUNITXML

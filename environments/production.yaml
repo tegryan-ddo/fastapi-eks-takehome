@@ -1,6 +1,8 @@
 # Production overrides for charts/mobile-api/values.yaml.
 # The image tag or digest is supplied at deploy time, not stored here.
 
-# Illustrative starting point, not a capacity figure. Autoscaling replaces
-# this in the next increment.
-replicaCount: 3
+autoscaling:
+  # Initial assumptions, not capacity figures. Set from load tests, and keep
+  # maxReplicas within the Postgres connection budget.
+  minReplicas: 3
+  maxReplicas: 12

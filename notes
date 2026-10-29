@@ -18,3 +18,6 @@ Out of scope
 Decisions
 - github actions are out due to billing issues
 - python downgraded to 3.13 so inspector code security works (docs list support up to 3.13)
+- liveness checks do not check the database.  readiness checks could, but only if the app doesn't do something useful when the db is unavailable (cached data, degraded serivice, error/maintenance page)
+- regarding the note above, ALBs fail open when there are no healthy targets
+- another option is a static maintenance page hosted in S3 as the lowest priority ALB route

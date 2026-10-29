@@ -7,13 +7,22 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN groupadd --gid 10001 app \
     && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin app
 
-WORKDIR /app
+WORKDIR /srv
 
 # Dependencies before source: this layer is reused until requirements.txt changes.
+# pip check fails the build on inconsistent pins. pip is needed only to build,
+# so it is then removed with the vendored libraries it carries, which image
+# scanners otherwise report against the runtime image.
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt \
+    && pip check \
+    && pip uninstall --yes pip
 
-COPY main.py .
+# Public RDS certificate authorities, used when DATABASE_URL has
+# sslmode=verify-full (the default). See certs/README.md.
+COPY certs/rds-global-bundle.pem /srv/certs/
+
+COPY app/ ./app/
 
 ARG APP_VERSION=dev
 ENV APP_VERSION=${APP_VERSION}
@@ -21,7 +30,10 @@ ENV APP_VERSION=${APP_VERSION}
 USER 10001:10001
 EXPOSE 8000
 
-# Exec form makes Uvicorn PID 1, so it receives SIGTERM directly.
-# Graceful shutdown is capped at 20s; the chart's terminationGracePeriodSeconds
-# (30s) covers this plus the 5s preStop sleep.
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--timeout-graceful-shutdown", "20"]
+# Exec form makes Uvicorn PID 1, so it receives SIGTERM directly and runs the
+# FastAPI lifespan shutdown. Graceful shutdown is capped at 20s; the chart's
+# terminationGracePeriodSeconds (30s) covers this plus the 5s preStop sleep.
+# Other entry points from the same image:
+#   python -m app.migrate   schema migration, run as a release step
+#   python -m app.batch     the daily batch, run by the CronJob
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--timeout-graceful-shutdown", "20"]

@@ -1,9 +1,17 @@
 # Delivery and operations proposal
 
-**Status: proposal.** None of the AWS resources described here exists yet:
-no CodePipeline, CodeBuild project, IAM role, VPC endpoint, ECR repository,
-dashboard, or alarm has been provisioned or tested. The table at the end
-separates what is implemented in this repository from what is proposed.
+**Status: staging exists; the rest is proposal.** Provisioned by
+[infra/](../infra/README.md) (CDK) and in use since 2026-10-29: the ECR
+repository, the CodeConnections connection, the validate and build CodeBuild
+projects, the staging VPC with its RDS PostgreSQL instance, the two
+VPC-connected runner projects (db-admin and integration), an EKS 1.37 Auto Mode
+cluster `mobile-api-staging` in the same VPC with the `metrics-server` add-on,
+the `mobile-api-secrets-sync` project that writes the Kubernetes Secret from
+Secrets Manager, and the `mobile-api-deploy-staging` project that runs Helm and
+the staging checks. The demo is deployed there and answers at
+`https://mobile-api-staging.digitaldevops.io`. Nothing else in this document
+exists: no CodePipeline, production deploy project, VPC endpoint, dashboard, or
+alarm. The table at the end separates implemented, provisioned, and proposed.
 
 GitHub hosts the source code and is how the repository is shared. Everything
 that builds, checks, or deploys runs in AWS. No GitHub Actions workflows and
@@ -30,10 +38,10 @@ Production image-gate (re-check) → deploy-production           production depl
 | Step | What happens |
 | --- | --- |
 | **Source** | CodeConnections delivers one specific commit, C, from the GitHub repository. Every later step works from artifacts derived from C. |
-| **Build and validate** | The build project runs the application tests and the chart checks (lint and render for both environments, schema validation, relationship checks; see [verification.md](verification.md)). It then builds the image, runs it locally with the chart's security restrictions, smoke-tests it, and pushes it to ECR. The output is the image digest, D. |
+| **Build and validate** | The build project (`mobile-api-build`, [buildspecs/build.yml](../buildspecs/build.yml)) runs `python -m pytest`: application tests, and chart checks (lint and render for both environments, schema validation, relationship checks). It then runs `scripts/verify_container.py`, which builds the image and checks it under the chart's restrictions against a PostgreSQL container: endpoints, a write and a read across a container replacement, a batch run and its replay, readiness during a database outage and after recovery, SIGTERM shutdown, and invalid batch input (see [verification.md](verification.md)). Finally it pushes the image to ECR tagged with the commit SHA and prints `release.json` with the digest, D. |
 | **Image gate** | Blocks the release until Inspector has scanned digest D and it has no unapproved critical or high findings (section 4). |
 | **Package** | Produces release artifact R: `helm package` of the chart, versioned `<chart version>+<short commit>`; `values/staging.yaml` and `values/production.yaml` taken from commit C; `release-values.yaml` setting `image.digest: D`; and `release.json` recording the commit, chart version, image digest, and pipeline execution ID. |
-| **Deploy staging** | The staging deploy project runs Helm with R only. |
+| **Deploy staging** | The staging deploy project runs Helm with R only. The migration hook Job runs first, inside `helm upgrade`; if it fails, no pod changes. |
 | **Verify staging** | Checks rollout health and application behaviour (below), and writes a verification report to S3. |
 | **Approve production** | A CodePipeline manual approval. `CustomData` names the commit, chart version, and digest; `ExternalEntityLink` points to the staging verification report; `NotificationArn` alerts approvers through SNS. Only a release-approver IAM group may call `codepipeline:PutApprovalResult`. The timeout is shortened from the 7-day default to 24 hours, so stale releases expire. |
 | **Deploy production** | Re-checks the image gate (continuous scanning may have found new issues), then deploys the same artifact R and digest D with `values/production.yaml` from R. |
@@ -63,20 +71,54 @@ the deployment logic also comes from the reviewed commit.
 
 ### Staging verification
 
-Implemented today (runs against the demo):
+Checks that also work with the demo:
 
-- Rollout: `kubectl rollout status` completes; every API pod is Ready; each
-  running pod's `imageID` contains digest D; no pod restarted after the
-  rollout; the Helm release status is `deployed`.
-- Behaviour: `python scripts/smoke_test.py https://<staging-host>
+- **Migration:** `helm upgrade` succeeded, which means the pre-upgrade hook Job
+  completed. Helm deletes a successful hook Job, so a surviving
+  `job/mobile-api-migrate` is a failed one: read its pod logs.
+- **Rollout:**
+  - `kubectl rollout status deployment/mobile-api` completes;
+  - every API pod is Ready;
+  - each running pod's `imageID` contains digest D;
+  - no pod restarted after the rollout;
+  - the Helm release status is `deployed`.
+- **Behaviour:** `python scripts/smoke_test.py https://<staging-host>
   --expect-service <name> --expect-version <version>`, run through the public
-  HTTPS hostname, the same path customers use.
+  HTTPS hostname, the same path customers use. Then `POST /demo/records` with a
+  unique note, `GET /demo/records/{id}`, `kubectl rollout restart
+  deployment/mobile-api`, and the same `GET` again: the record outlives the
+  pods.
+- **Batch:** the CronJob is suspended in staging. A Job created manually from
+  `cronjob/mobile-api-batch` for one business date must complete using digest
+  D; a second Job for the same date must complete too, and
+  `GET /demo/batch-runs/<date>` must show one row with `run_count: 2`. The
+  procedure is in [verification.md](verification.md#manual-staging-batch-run).
 
 Required for the real application, specified in
-[verification.md](verification.md#staging-acceptance-plan): a real database
-read and write; duplicate and invalid-signature webhooks; a batch replay for
-the same business period; a rollout while requests are in flight; and an
-unhealthy replacement that never becomes ready.
+[verification.md](verification.md#staging-acceptance-plan):
+
+- the real schema's migrations against staging data;
+- duplicate and invalid-signature webhooks;
+- the expected business output of the batch, and a safe replay of the same
+  business period (the demo's `batch_runs` upsert shows only the demo's
+  replay);
+- a rollout while requests are in flight;
+- an unhealthy replacement that never becomes ready;
+- a database outage: readiness fails, liveness holds, recovery is automatic.
+
+The `mobile-api-deploy-staging` project implements the rollout, behaviour, and
+batch checks ([buildspecs/deploy-staging.yml](../buildspecs/deploy-staging.yml))
+and ran them on 2026-10-29 against the staging cluster: Helm revision 1 with
+image `sha256:dd89cf3d…`, the HTTPS smoke test, a write and a read, and the
+manual batch Job on the same digest. Helm revision 2 then rolled the API over to
+`sha256:5b2e6b47…`, and a record written before it was read after it. Helm
+revision 3 (the same image, deploy build `f0526314`) ran the second manual Job
+for the same business date: `GET /demo/batch-runs/2026-10-29` then showed one
+row with `run_count` 2, the documented replay behaviour, against RDS. It shows
+the demo's upsert only, not the real job's idempotency. One correction along
+the way: the build's digest check at first counted a terminating old pod and
+failed after a successful rollout; it now counts only Running, non-terminating
+pods.
 
 ### Why QUEUED execution, and why stages are grouped this way
 
@@ -109,10 +151,17 @@ long-lived access keys exist, and none are stored in GitHub.
 
 | Role | Used by | Allows | Does not allow |
 | --- | --- | --- | --- |
-| Build | build-and-validate, image gate, package | ECR push and read on the `mobile-api` repository only (plus `ecr:GetAuthorizationToken`); `ecr:DescribeImageScanFindings`; read and write on the pipeline artifact bucket and its KMS key; its own CloudWatch log group; CodeBuild reports | Any `eks:*` action. It has no EKS access entry, so it cannot authenticate to any cluster. |
-| Staging deploy | deploy-staging, verify-staging | `eks:DescribeCluster` on the staging cluster; read artifacts and write verification reports in S3; KMS decrypt; its log group; VPC network-interface permissions | ECR push; production cluster or namespace |
+| Build | build-and-validate, image gate, package | Granted today (infra/): ECR push, pull and `ecr:DescribeImages` on the `mobile-api` repository only (plus `ecr:GetAuthorizationToken`); its own CloudWatch log group; CodeBuild reports; reading the CodeConnections connection. Proposed with the pipeline: `ecr:DescribeImageScanFindings`, the artifact bucket and its KMS key | Any `eks:*` action. It has no EKS access entry, so it cannot authenticate to any cluster. |
+| Staging deploy (`mobile-api-deploy-staging`) | deploy-staging, verify-staging | Granted today (infra/): `eks:DescribeCluster` on the staging cluster, `ecr:DescribeImages` on the repository (to resolve a tag to its digest), Route53 record changes in the one hosted zone, its log group, reading the connection. Proposed with the pipeline: artifacts and verification reports in S3, KMS decrypt. It runs outside the VPC because the staging endpoint is public and private (section 3). | ECR push; Secrets Manager; production cluster or namespace |
+| Secrets sync (`mobile-api-secrets-sync`) | writes Kubernetes Secret `mobile-api-runtime`; optional restart of the Deployment | `eks:DescribeCluster`; `GetSecretValue` on `/mobile-api/staging/runtime`; its log group | ECR; the master secret; anything in Kubernetes beyond the one Secret and the one Deployment |
 | Production deploy | image re-check, deploy-production, verify-production | The same as staging deploy, but for production, plus `ecr:DescribeImageScanFindings` and `cloudwatch:DescribeAlarms` | ECR push; staging |
 | Validation | pull-request validation project | Its log group and report group | Everything else |
+| DB admin (`mobile-api-db-admin`) | one-off creation of the application role in RDS | Read `/mobile-api/staging/rds-master` and the whole `/mobile-api/staging/runtime` secret (IAM cannot scope to a JSON key; the buildspec selects `DATABASE_URL`); VPC network interfaces; its log group | ECR, EKS, S3 |
+| Integration (`mobile-api-integration`) | `python -m app.migrate` and `tests/integration` against RDS | Read the whole `/mobile-api/staging/runtime` secret (the buildspec selects `DATABASE_URL`); VPC network interfaces; its log group and report group | The master secret; ECR push; EKS |
+
+The build, validation, db-admin, integration, staging deploy, and secrets-sync
+roles are provisioned by [infra/](../infra/README.md) (CDK). The production
+deploy role is proposed.
 
 Each role trusts `codebuild.amazonaws.com` with an `aws:SourceArn` condition
 naming its own project. The staging project therefore cannot use the
@@ -122,22 +171,26 @@ notifications.
 
 **Kubernetes authorization** uses EKS access entries mapped to Kubernetes
 RBAC. The cluster's authentication mode must be `API` or
-`API_AND_CONFIG_MAP`, which is an assumption. Each deploy role gets a standard
-access entry with `kubernetesGroups` set to its environment's group:
+`API_AND_CONFIG_MAP`; the staging cluster uses `API` and no identity gets
+implicit access. Each deploy role gets a standard access entry with
+`kubernetesGroups` set to its environment's group:
 `mobile-api-staging-deployers` or `mobile-api-production-deployers`. No EKS
 access policy is associated, so
 [`platform/deploy-rbac.yaml`](../platform/deploy-rbac.yaml) is the role's only
-Kubernetes permission.
+Kubernetes permission. On staging the bootstrap applied it once, together with
+`platform/eks/`, and an impersonation check confirmed the deployer group can
+manage the chart's kinds and Jobs but not Secrets or the namespace.
 
 That file holds one `ClusterRole`, which grants nothing by itself. It is bound
 by a `RoleBinding` in each environment's namespace, so each group can act only
 in its own namespace. The role allows:
 
 - full management of only the kinds the chart renders: ServiceAccounts,
-  Services, and Deployments;
+  Services, Deployments, HPAs, PDBs, CronJobs, and Ingresses;
+- Jobs, for the migration hook and for manual staging batch runs;
 - ConfigMaps, for Helm's release history;
-- read-only access to ReplicaSets, Pods, and Events, to wait for and verify
-  rollouts.
+- read-only access to ReplicaSets, Pods, Events, and pod logs, to wait for and
+  verify rollouts and Jobs.
 
 It does not allow:
 
@@ -155,27 +208,123 @@ account in the namespace.
 
 The deploy projects set `HELM_DRIVER=configmap`, so Helm stores release
 history in ConfigMaps instead of Secrets. That is why the deployer needs no
-access to Secrets at all. This includes the application credentials that a
-later secrets integration will place in the namespace.
+access to Secrets at all, including the application credentials the secrets
+integration places in the namespace. Pods still receive those credentials: the
+kubelet resolves `secretKeyRef` with its own authorization, not the
+deployer's.
 
 Trade-offs of this tighter option:
 
 - **New kinds need an RBAC change.** Each kind the chart adds needs a
-  cluster-administrator change: HPA, PDB, Ingress, CronJob, the migration Job
-  (with `pods/log` read), and custom resources such as `ExternalSecret`. The
-  chart tests fail until the role covers every rendered kind, so the gap shows
-  up in a pull request, not in a failed deployment.
+  cluster-administrator change, for example custom resources such as
+  `ExternalSecret`. The chart tests fail until the role covers every
+  rendered kind, so the gap shows up in a pull request, not in a failed
+  deployment.
 - **Release history is readable.** Anyone who can read ConfigMaps in the
   namespace can read Helm's release history. This is acceptable because values
   and manifests never contain credentials.
 - **The driver is hard to change later.** Changing Helm's storage driver later
   means migrating release history, so choose it before the first install.
 
+### Application secrets
+
+Uploading a secret to AWS Secrets Manager does **not** make it available to a
+workload. These are separate steps with separate owners.
+
+1. **Upload, by an operator.** `scripts/load_secrets.py` writes one secret per
+   environment, `/mobile-api/<environment>/runtime`, holding the JSON keys
+   `DATABASE_URL` and `PAYMENTS_WEBHOOK_SECRET`. `DATABASE_URL` is
+   `postgresql://mobile_api_app:<password>@<rds-endpoint>:5432/mobileapi?sslmode=verify-full`,
+   where the operator chooses the password for the application role.
+   - **Where it runs:** in the operator's own trusted terminal, signed in with
+     an AWS SSO profile. Never in CI, the pipeline, or an AI agent's terminal.
+   - **How values are handled:** each value is typed twice at a hidden prompt
+     and sent straight to Secrets Manager. Values never appear in arguments,
+     environment variables, files, or output.
+   - **Safeguards:** it refuses to run without an interactive terminal,
+     confirms the AWS account and the destination name, ignores endpoint
+     overrides, never reads a value back, and suppresses SDK logs and raw
+     errors.
+   - **Operator IAM:** `secretsmanager:DescribeSecret`, plus `CreateSecret` to
+     create or `PutSecretValue` to replace, scoped to that environment's secret
+     names, plus KMS permissions if a customer-managed key is used.
+   - **Unconfirmed writes:** if AWS doesn't confirm a write, the tool prints the
+     version token it used. Check that version with `ListSecretVersionIds`
+     before writing again.
+   - **Limits:** values exist in the process's memory while being sent. A
+     compromised workstation or a recorded terminal session can still expose
+     them.
+   - **How staging was loaded:** the operator used the AWS CLI instead,
+     `aws secretsmanager create-secret --secret-string file://<local file>`
+     from their own machine, and deleted the file afterwards. The boundary
+     held: the values never reached Git, CI, or the agent. The loader stays
+     the designed path because it writes nothing to disk.
+2. **Create the database role, once (`mobile-api-db-admin`, provisioned).**
+   An operator starts this CodeBuild project after step 1; for staging it ran
+   on 2026-10-29. Inside the VPC it
+   connects as the RDS master user and runs
+   `platform/db/create_app_user.sql`, which creates `mobile_api_app` with the
+   password from the secret loaded in step 1 and grants it `CREATE` on schema
+   `public`. The master secret, `/mobile-api/staging/rds-master`, is
+   generated by RDS and read by nothing else.
+3. **Sync, by the cluster's existing integration (assumed).**
+   - **What we assume:** the platform runs External Secrets Operator,
+     authenticated with EKS Pod Identity. It maintains a Kubernetes Secret
+     `mobile-api-runtime` in each environment's namespace, holding the same two
+     keys from `/mobile-api/<environment>/runtime`, and refreshes it on its
+     configured interval.
+   - **Permissions:** only its role holds `secretsmanager:GetSecretValue`, and
+     only on `/mobile-api/<environment>/*`.
+   - **Ownership:** neither this chart nor the pipeline manages it.
+   - **If the integration differs** (for example the Secrets Store CSI driver),
+     only `runtimeSecret.name` and the restart behaviour below change.
+   - **This exercise's stand-in:** the `mobile-api-secrets-sync` CodeBuild
+     project (infra/, provisioned and run) reads `/mobile-api/staging/runtime`
+     and writes Secret `mobile-api-runtime` in the staging namespace. It does
+     not refresh on its own; run it again after the secret changes.
+4. **Consume, through the chart.**
+   - **How:** with `runtimeSecret.name: mobile-api-runtime` (the default), the
+     API container reads both keys as environment variables through
+     `secretKeyRef`. The batch and the migration hook read only
+     `DATABASE_URL`.
+   - **What's in Git:** only the Secret's name and key names appear in values
+     or manifests.
+   - **Required:** PostgreSQL is required, so the Secret must exist before the
+     first install; the migration hook reads it. With an empty name the chart
+     renders no references, and every workload fails at startup with a clear
+     configuration error rather than running without a database.
+
+**After a secret changes:**
+
+- **API:** environment variables are read when a container starts. Once the
+  Kubernetes Secret shows the new version, restart the API with `kubectl
+  rollout restart deployment/mobile-api -n <namespace>`. This is a normal
+  rolling update with `maxUnavailable: 0`.
+- **Batch and migration:** the next Job reads the new value. A Job already
+  running keeps the old one.
+- **Rotation:** a PostgreSQL role holds one password, so changing it breaks
+  every running pod until it restarts. Rotate without downtime by alternating
+  between two application roles (set the new role's URL in the secret, let it
+  sync, restart, then retire the old role), or accept a short window in which
+  readiness fails until the rollout restart completes. The webhook-secret
+  rotation procedure depends on the payment-provider contract (section 7).
+
+Neither the build nor the deploy roles can read application secrets: they have
+no `GetSecretValue`, and the deployer role has no Kubernetes Secrets access.
+Three roles are the deliberate exceptions: db-admin reads the master secret and
+`DATABASE_URL` once to create the role, the integration runner reads
+`DATABASE_URL`, and secrets-sync reads the runtime secret to write the one
+Kubernetes Secret.
+
 ## 3. Networking for a private EKS API endpoint
 
-Image building stays in the build project. That is the only project with
-privileged mode, because Docker needs it, and it needs no cluster access. The
-deploy projects are unprivileged, have no Docker, and run in the VPC:
+This section is the proposed production setup. The staging cluster takes a
+simplification: its API endpoint is public as well as private, so
+`mobile-api-deploy-staging` and `mobile-api-secrets-sync` run outside the VPC
+and authenticate with IAM only. Image building stays in the build project. That
+is the only project with privileged mode, because Docker needs it, and it needs
+no cluster access. With a private endpoint, the deploy projects are
+unprivileged, have no Docker, and run in the VPC:
 
 - **Subnets:** private subnets in the cluster VPC. A peered or Transit Gateway
   VPC also works, but needs the DNS step below.
@@ -202,6 +351,39 @@ Helm and kubectl come from a pinned deploy-tools image in ECR, so the deploy
 projects need no internet access. If the EKS endpoint is public with a CIDR
 allowlist instead, keep the same VPC configuration and allow the NAT gateway's
 Elastic IP.
+
+### RDS environment
+
+Provisioned by [infra/](../infra/README.md) (CDK) to reproduce the external
+database for this exercise. Database tuning is out of scope.
+
+| Item | Setting |
+| --- | --- |
+| Network | VPC `mobile-api`, private subnets, one NAT gateway for the runners' outbound access (PyPI, GitHub, ECR, Secrets Manager) |
+| Instance | RDS for PostgreSQL 17 `mobile-api-staging`, `db.t4g.micro`, storage encrypted, not publicly accessible, database `mobileapi` |
+| Inbound | TCP 5432 only from the integration-runner security group and from the cluster security group of the EKS Auto Mode cluster `mobile-api-staging` in the same VPC (rule created by the EKS stack). Nothing else, including the build project, can reach it. |
+| TLS | Server certificate from RDS CA `rds-ca-rsa2048-g1`. Clients use `sslmode=verify-full`, verifying certificate and hostname against the RDS global bundle baked into the image. |
+| Master user | `postgres_admin`; credentials generated by RDS into Secrets Manager `/mobile-api/staging/rds-master`. Used only by the one-off `mobile-api-db-admin` runner, never by the application, the pipeline, or in this conversation. |
+| Application role | `mobile_api_app`, created by `platform/db/create_app_user.sql` with the password the operator loaded into `/mobile-api/staging/runtime`. Owns the application's schema objects and has `CREATE` on schema `public`, so migrations run as this role. |
+
+How things reach it:
+
+- **Application pods** connect from the EKS cluster over the VPC: the cluster
+  shares this VPC, the endpoint's private DNS name resolves from it, and the
+  pods carry the cluster security group that is allowed in. Verified on
+  2026-10-29: readiness 200, writes and reads through the API, the migration
+  hook, and the batch Job, all against RDS with `sslmode=verify-full`.
+- **Integration runner** (`mobile-api-integration`) runs in the private subnets
+  with the allowed security group. CodeBuild injects `DATABASE_URL` from
+  Secrets Manager at build start; the runner applies the migrations, then runs
+  `tests/integration`.
+- **db-admin runner** (`mobile-api-db-admin`) uses the same network path once,
+  as the master user.
+- **Nothing else.** No bastion, no public endpoint, no developer workstations.
+  Ad-hoc SQL goes through a one-off runner build.
+
+Production has no database yet; its connection budget and pooler decision are
+in section 7.
 
 ## 4. Security gates
 
@@ -236,6 +418,21 @@ findings block again.
 `python:3.13-slim`, and lists Python as a supported language. That it detects
 the pip-installed packages in this image is not yet confirmed. Check the first
 scan's inventory for `fastapi` and `uvicorn`.
+
+**Local evidence, and a decision this forces.** Trivy 0.76.1 (a local stand-in;
+Inspector's results will differ) scanned the demo image on 2026-10-28:
+
+- **Critical:** none.
+- **High, fixable:** none. Five came from pip's vendored libraries; pip is now
+  removed from the runtime image.
+- **High, unfixable:** 44, all in Debian base-image packages with no fixed
+  version (util-linux, ncurses, systemd libraries, perl-base).
+
+Under the rule above, every release would block until each unfixable finding
+has an owned, expiring exception. The choice is between keeping that strict
+rule, with per-CVE exceptions renewed as Debian ships fixes, or blocking only
+findings with a fix available, while tracking unfixable ones on the dashboard.
+This is listed in section 7.
 
 ### Source analysis: Amazon Inspector Code Security
 
@@ -295,14 +492,20 @@ records.
 or more replicas racing to migrate, startup and readiness would become
 unpredictable.
 
-- The deploy project runs a single Kubernetes Job with the same digest D and
-  the migration command, before `helm upgrade`. The Job has `backoffLimit: 0`
-  and a deadline. If it fails, the release stops before any API pod changes.
-  Adding this step means granting the deployer role `jobs` and read access to
-  `pods/log`.
+- The chart runs the migration as a Helm `pre-install,pre-upgrade` hook Job
+  with the same digest D (`templates/migrate-job.yaml`, implemented). Helm
+  creates it before any other resource changes and waits for it. It has
+  `backoffLimit: 0` and a 10-minute deadline. If it fails, `helm upgrade`
+  fails before any API pod changes, and the failed Job stays for diagnosis.
+  The deployer role already covers Jobs and pod logs.
+- A hook Job is not part of the release's rollback: `--rollback-on-failure`
+  restores the previous manifests, not the schema. Backward-compatible changes
+  are what make that safe.
 - Schema changes are backward compatible (expand, then contract):
   - A release may only add: new tables, nullable columns, and indexes built
-    concurrently.
+    concurrently. `CREATE INDEX CONCURRENTLY` cannot run inside a transaction,
+    so such a migration file starts with `-- migrate: no-transaction` and holds
+    that one statement; the runner records it only after it succeeds.
   - The code works with both the old and the new schema.
   - Drops and renames ship in a later release, once neither the running
     version nor the rollback target uses the old shape.
@@ -326,8 +529,9 @@ period set.
 
 | Signal | Source | State |
 | --- | --- | --- |
-| Request count, target and load-balancer 5xx, target response time, healthy and unhealthy hosts | ALB metrics | Available once the ALB exists; no app change |
+| Request count, target and load-balancer 5xx, target response time, healthy and unhealthy hosts | ALB metrics | Available now for staging, where the ALB exists; no app change |
 | Pod CPU and memory against requests, restarts, running pods | Container Insights (Observability add-on) | Available once the add-on is installed |
+| Database: connections, CPU, free storage and memory, read and write latency | RDS CloudWatch metrics (`DatabaseConnections`, `CPUUtilization`, `FreeStorageSpace`, `FreeableMemory`, `ReadLatency`, `WriteLatency`) | Available now for the staging instance; no app change. There is no read replica, so no replica-lag metric. |
 | Per-operation latency, errors, and faults; SLOs | CloudWatch Application Signals: OpenTelemetry auto-instrumentation from the add-on, enabled by the pod annotation `instrumentation.opentelemetry.io/inject-python: "true"` | Supports Python 3.10–3.14. The single Uvicorn worker avoids the documented pre-fork caveat. |
 | Build and deploy outcome and duration | CodeBuild metrics, CodePipeline events | Available once the pipeline exists |
 | Payment completion: webhooks received, signature-rejected, processed, failed, duplicate; processing lag | Application metrics (CloudWatch Embedded Metric Format) | **Needs instrumentation** |
@@ -378,8 +582,8 @@ destination, which is still unresolved:
 
 | Class | SNS topic | Examples |
 | --- | --- | --- |
-| **Urgent:** customer or business impact now. Production only, at any hour. | `mobile-api-production-urgent` | SLO fast burn. Canary failing twice in a row. Healthy targets below minimum. Webhook processing failures or lag over threshold (payments not completing). Batch not finished by its deadline. Failed production verification whose rollback also failed. |
-| **Working hours:** investigate, no immediate impact. | `mobile-api-<env>-ops` | SLO slow burn. Restarts or OOM kills. CPU or memory near requests. Rising database pool waits. Batch slower than usual but within its deadline. Staging deploy or verify failures. Validation build failures. Image-gate failures. New critical finding on a running image. |
+| **Urgent:** customer or business impact now. Production only, at any hour. | `mobile-api-production-urgent` | SLO fast burn. Canary failing twice in a row. Healthy targets below minimum. Webhook processing failures or lag over threshold (payments not completing). Batch not finished by its deadline. Every pod unready, or `DatabaseConnections` at the instance limit. Failed production verification whose rollback also failed. |
+| **Working hours:** investigate, no immediate impact. | `mobile-api-<env>-ops` | SLO slow burn. HPA held at maxReplicas (capacity, or the database connection budget). A failed batch Job that can still finish within its deadline. Restarts or OOM kills. CPU or memory near requests. Rising database pool waits. `DatabaseConnections` above 80% of the limit. `FreeStorageSpace` below 20%. Batch slower than usual but within its deadline. Staging deploy or verify failures. Validation build failures. Image-gate failures. New critical finding on a running image. |
 
 Staging alarms go only to the working-hours topic. Thresholds use rates rather
 than counts, because overnight traffic is a tenth of peak. A missing canary
@@ -397,18 +601,27 @@ data point counts as breaching; missing 5xx data does not.
   - source IP ranges;
   - sandbox support.
 - **Database connection budget:**
-  - Postgres `max_connections`, and how much other clients use;
-  - pool size per pod times maximum replicas;
+  - the staging instance is a `db.t4g.micro`, whose `max_connections` is low;
+    `maxReplicas × DATABASE_POOL_MAX (5)` plus the batch and the runners must
+    fit, and the production instance class is unknown;
   - whether a pooler or RDS Proxy is needed;
-  - whether Postgres is RDS, which determines the AWS metrics available.
-- **Batch deadline.** When the daily job must finish, and which key identifies
-  a business period.
+  - the production database, which is not provisioned.
+- **EKS workload security group** of the employer's cluster, for the RDS
+  inbound rule (staging uses its own cluster's group).
+- **Batch contract.**
+  - production schedule and time zone;
+  - business-date semantics (the demo defaults to the current UTC date);
+  - expected duration;
+  - completion deadline;
+  - which key identifies a business period for safe replay.
+- **Image-gate policy for unfixable base-image CVEs** (section 4).
 - **Operational destination.** Where SNS delivers, and who is on call.
-- **Platform:**
+- **Platform** (for the employer's cluster; staging answers each for itself):
   - one cluster with two namespaces, or separate clusters;
-  - EKS endpoint access: private or public;
+  - EKS endpoint access: private or public (staging: both);
   - whether NAT is available;
-  - whether the cluster's authentication mode supports access entries.
+  - whether the cluster's authentication mode supports access entries
+    (staging: `API`).
 - **Dependency scanning.** Whether Inspector Code Security reads
   `requirements.txt`.
 
@@ -416,8 +629,12 @@ data point counts as breaching; missing 5xx data does not.
 
 | Item | State |
 | --- | --- |
-| Chart, environment values, demo application | Implemented. Chart linted, rendered, and schema-validated. Demo run natively. Not installed on a cluster. |
-| Chart tests, smoke test, secret scan, validation buildspec | Implemented and run locally. The buildspec has not run in CodeBuild. |
-| Deployer RBAC (`platform/deploy-rbac.yaml`) | Written, schema-validated, and checked against the rendered chart. Not applied to any cluster. |
-| Container image | Built and run locally with Podman under the chart's restrictions. Not pushed to any registry. |
-| Everything else in this document | Proposed only |
+| Chart (API, HPA, PDB, CronJob, migration hook Job, Ingress, secret references) and environment values | Implemented. Linted, rendered, schema-validated, relationship-checked, and installed on the staging cluster (Helm release `mobile-api`, revisions 1 to 3, 2026-10-29). |
+| EKS 1.37 Auto Mode cluster `mobile-api-staging`, `metrics-server` add-on, `mobile-api-secrets-sync`, `mobile-api-deploy-staging`, HTTPS Ingress through an ALB at `mobile-api-staging.digitaldevops.io` | Provisioned by infra/ (CDK) and used: Secret synced, three deploys, two manual batch Jobs (replay shown), HPA reading CPU. Endpoint public and private (a simplification). |
+| Demo application (PostgreSQL persistence, migration, batch replay) and container image | Implemented. Unit-tested; built, checked (26/26), and pushed by `mobile-api-build` for commits `73de0a8` and `61fb83d`; running on staging against RDS. |
+| Chart, app, integration, and secrets-loader tests; container check; smoke test; secret scan; buildspecs | Implemented. Run locally and in CodeBuild; the integration tests ran against RDS; the smoke test ran against the staging hostname. |
+| ECR repository, CodeConnections connection, CodeBuild validate and build projects | Provisioned by infra/ (CDK). `mobile-api-validate` runs on pull requests through the GitHub App webhook; `mobile-api-build` has pushed two images tagged by commit SHA. ECR basic scanning is on (enhanced scanning is not enabled for the account). |
+| Staging VPC, RDS PostgreSQL 17 instance, db-admin and integration runners | Provisioned by infra/ (CDK) and run: application role created, schema applied, 6 integration tests passed over TLS. |
+| Secrets loader (`scripts/load_secrets.py`) | Implemented. Offline tests only. The operator stored the staging secret with the AWS CLI instead; the agent never ran the loader or saw a value. |
+| Deployer RBAC (`platform/deploy-rbac.yaml`) and the bootstrap manifests in `platform/eks/` | Applied once to the staging cluster (the staging binding only); checked by impersonation. |
+| Everything else in this document: CodePipeline, production, image gate, Inspector, monitoring, alarms, private-endpoint networking | Proposed only |

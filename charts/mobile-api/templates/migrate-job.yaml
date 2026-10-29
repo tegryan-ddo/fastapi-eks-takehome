@@ -1,0 +1,52 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ include "mobile-api.migrateName" . }}
+  labels:
+    {{- include "mobile-api.labels" . | nindent 4 }}
+    app.kubernetes.io/component: migrate
+  annotations:
+    # Runs before any API or batch pod of the release changes. Helm waits for
+    # it; a failure stops the release before any workload is touched.
+    helm.sh/hook: pre-install,pre-upgrade
+    helm.sh/hook-weight: "0"
+    # The previous hook Job is removed before a new one starts, and a
+    # successful Job is removed at once. A failed Job is kept for diagnosis
+    # until the next release or ttlSecondsAfterFinished.
+    helm.sh/hook-delete-policy: before-hook-creation,hook-succeeded
+spec:
+  # One attempt: the command is idempotent, so the next release simply retries.
+  backoffLimit: 0
+  activeDeadlineSeconds: {{ .Values.migrate.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: {{ .Values.migrate.ttlSecondsAfterFinished }}
+  template:
+    metadata:
+      labels:
+        {{- include "mobile-api.labels" . | nindent 8 }}
+        app.kubernetes.io/component: migrate
+    spec:
+      # A pre-install hook runs before the chart's ServiceAccount exists, so
+      # this pod uses the namespace default account. No token is mounted.
+      automountServiceAccountToken: false
+      restartPolicy: Never
+      securityContext:
+        {{- include "mobile-api.podSecurityContext" . | nindent 8 }}
+      containers:
+        - name: migrate
+          image: {{ include "mobile-api.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["python", "-m", "app.migrate"]
+          {{- if and .Values.runtimeSecret.name .Values.migrate.secretKeys }}
+          {{- include "mobile-api.secretEnv" (dict "secret" .Values.runtimeSecret.name "keys" .Values.migrate.secretKeys) | nindent 10 }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.migrate.resources | nindent 12 }}
+          securityContext:
+            {{- include "mobile-api.containerSecurityContext" . | nindent 12 }}
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
